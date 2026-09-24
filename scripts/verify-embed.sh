@@ -10,13 +10,34 @@
 #     导致后续重跑（同一 runner 复用）时 bind 失败。
 set -uo pipefail
 
+# 打开命令追踪，CI 里失败时能从日志看清每一步到底做了什么。
+if [ "${VERIFY_EMBED_TRACE:-0}" = "1" ]; then
+  set -x
+fi
+
 BIN="${1:-bin/livemonitor}"
-ADDR="127.0.0.1:18099"
 TMPDIR_LOCAL="$(mktemp -d)"
 CONFIG="$TMPDIR_LOCAL/config.json"
 INDEX="$TMPDIR_LOCAL/index.html"
 SERVER_LOG="$TMPDIR_LOCAL/server.log"
 SRV_PID=""
+PORT=""
+ADDR=""
+
+# 挑一个当前空闲的端口。
+#
+# 不要用固定端口：runner 上端口占用情况不可控，一旦被占，服务会因监听失败而
+# 退出，症状是"服务在就绪前退出"，和真正要校验的嵌入问题毫无关系，排查成本极高。
+# 这里用 Python 让内核分配一个空闲端口后立刻释放，再交给被测进程使用。
+pick_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
 
 cleanup() {
   if [ -n "$SRV_PID" ] && kill -0 "$SRV_PID" 2>/dev/null; then
@@ -41,6 +62,20 @@ fail() {
 if [ ! -x "$BIN" ]; then
   fail "未找到可执行文件: $BIN"
 fi
+
+if [ -n "${VERIFY_EMBED_ADDR:-}" ]; then
+  ADDR="$VERIFY_EMBED_ADDR"
+else
+  PORT="$(pick_port)"
+  if [ -z "$PORT" ]; then
+    fail "无法获取空闲端口（python3 不可用？）"
+  fi
+  ADDR="127.0.0.1:$PORT"
+fi
+
+echo "[verify-embed] 二进制: $BIN"
+echo "[verify-embed] 监听地址: $ADDR"
+echo "[verify-embed] 临时目录: $TMPDIR_LOCAL"
 
 "$BIN" init -config "$CONFIG" || fail "init 失败"
 

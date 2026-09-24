@@ -44,5 +44,16 @@ jobs:
       - name: 校验内嵌资源可用
         # go:embed 指向的文件缺失会导致编译失败，但路径写错而文件恰好存在时
         # 只有运行期才会暴露。这里直接起服务拉一次首页，确认页面确实被内嵌进二进制。
-        # 具体逻辑放在脚本里，便于本地复现且保证退出时一定清理进程。
-        run: bash scripts/verify-embed.sh bin/livemonitor
+        # 具体逻辑放在脚本里，便于本地复现；打开命令追踪便于失败时定位。
+        env:
+          VERIFY_EMBED_TRACE: '1'
+        run: |
+          set +e
+          bash scripts/verify-embed.sh bin/livemonitor 2>&1 | tee /tmp/verify-embed.log
+          status=${PIPESTATUS[0]}
+          if [ "$status" -ne 0 ]; then
+            echo "::error::内嵌资源校验失败（退出码 $status）"
+            echo "----- 完整输出 -----"
+            cat /tmp/verify-embed.log
+          fi
+          exit "$status"
