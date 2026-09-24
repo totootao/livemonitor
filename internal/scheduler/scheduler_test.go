@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -146,4 +148,266 @@ func TestPanicInJobDoesNotCrashScheduler(t *testing.T) {
 		t.Error("单个任务 panic 不应终止调度器")
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+// ---------- 触发记录持久化 ----------
+
+// TestStatePersistsAcrossRestart 是这次线上故障的核心回归用例。
+//
+// 现象：同一个容器在几分钟内被反复启动，日志里出现多条
+// "容器已在运行，本次计划跳过"。根因是"今天是否已执行"只存在内存里，
+// 进程重启（或任何配置热更新）都会把它清零，于是当天所有已过点的任务被重放。
+//
+// 这里模拟：第一个调度器触发过任务 → 落盘 → 第二个调度器（等价于重启后的进程）
+// 加载同一份状态，即使任务时刻已过也**不能**再触发一次。
+func TestStatePersistsAcrossRestart(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "scheduler-state.json")
+
+	// ---- 第一个进程 ----
+	s1 := New(logging.New("test"))
+	s1.SetStatePath(statePath)
+	s1.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+
+	if !s1.RunOnce() {
+		t.Fatal("首个进程应触发已到点的任务")
+	}
+	if _, err := os.Stat(statePath); err != nil {
+		t.Fatalf("触发后应写出状态文件: %v", err)
+	}
+
+	// ---- 第二个进程（重启） ----
+	s2 := New(logging.New("test"))
+	s2.SetStatePath(statePath)
+
+	var mu sync.Mutex
+	fired := 0
+	s2.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {
+		mu.Lock()
+		fired++
+		mu.Unlock()
+	}})
+
+	if s2.RunOnce() {
+		mu.Lock()
+		n := fired
+		mu.Unlock()
+		t.Fatalf("重启后不应重放当天已执行的任务，实际触发 %d 次", n)
+	}
+
+	mu.Lock()
+	n := fired
+	mu.Unlock()
+	if n != 0 {
+		t.Errorf("重启后任务触发次数 = %d, 期望 0", n)
+	}
+}
+
+// TestStateSurvivesJobRebuild 覆盖配置热更新的场景。
+//
+// Reload 会 RemoveByPrefix + Add 重建所有 Job 对象。如果 Add 不继承已有的
+// 触发记录，重建后的任务会因为 lastRunDate 为空而再次触发——
+// 这正是日志里同一个容器名出现两次的原因。
+func TestStateSurvivesJobRebuild(t *testing.T) {
+	s := New(logging.New("test"))
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	if !s.RunOnce() {
+		t.Fatal("首次应触发")
+	}
+
+	// 模拟 installContainer：先移除，再以同样的 ID 重新添加。
+	s.RemoveByPrefix("c1")
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+
+	if s.RunOnce() {
+		t.Error("任务重建后不应重放当天已执行的任务")
+	}
+}
+
+// TestStateSurvivesReloadWithoutRemove 覆盖只 Add 不 Remove 的幂等路径。
+func TestStateSurvivesReloadWithoutRemove(t *testing.T) {
+	s := New(logging.New("test"))
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	if !s.RunOnce() {
+		t.Fatal("首次应触发")
+	}
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	if s.RunOnce() {
+		t.Error("重复 Add 同一任务不应导致重放")
+	}
+}
+
+// TestLoadStateDropsYesterdayEntries 昨天的记录没有意义，必须丢弃。
+func TestLoadStateDropsYesterdayEntries(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "scheduler-state.json")
+
+	// 直接写一份"昨天触发过"的状态文件。
+	stale := `{"c1":"2020-01-01"}`
+	if err := os.WriteFile(statePath, []byte(stale), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath)
+
+	var fired int
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() { fired++ }})
+	if !s.RunOnce() {
+		t.Error("昨天的触发记录不应阻止今天执行")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	if fired != 1 {
+		t.Errorf("任务触发次数 = %d, 期望 1", fired)
+	}
+}
+
+// TestLoadStateHandlesCorruptFile 状态文件损坏时应降级为"未执行"，而不是崩溃。
+func TestLoadStateHandlesCorruptFile(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "scheduler-state.json")
+	if err := os.WriteFile(statePath, []byte("{ not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath) // 不应 panic
+
+	if !s.RunOnce() {
+		t.Log("损坏状态下按未执行处理")
+	}
+}
+
+// TestLoadStateMissingFileIsFine 状态文件不存在是首次启动的正常情形。
+func TestLoadStateMissingFileIsFine(t *testing.T) {
+	s := New(logging.New("test"))
+	s.SetStatePath(filepath.Join(t.TempDir(), "does-not-exist.json"))
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+
+	if !s.RunOnce() {
+		t.Error("首次启动应正常触发任务")
+	}
+}
+
+// TestSaveStateIsAtomic 落盘应经由临时文件 + rename，不留半截文件。
+func TestSaveStateIsAtomic(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "scheduler-state.json")
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath)
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.RunOnce()
+
+	if _, err := os.Stat(statePath + ".tmp"); !os.IsNotExist(err) {
+		t.Error("落盘后不应残留 .tmp 文件")
+	}
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	today := time.Now().Format("2006-01-02")
+	if !stringsContains(string(data), today) {
+		t.Errorf("状态文件应包含今天的日期 %s，实际内容: %s", today, data)
+	}
+}
+
+// TestSaveStateCreatesMissingDir 状态目录不存在时应自动创建。
+func TestSaveStateCreatesMissingDir(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "nested", "deeper", "scheduler-state.json")
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath)
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.RunOnce()
+
+	if _, err := os.Stat(statePath); err != nil {
+		t.Errorf("应自动创建目录并写出状态文件: %v", err)
+	}
+}
+
+// TestNoStatePathStillWorks 未配置落盘路径时，行为应与旧版一致（内存记录）。
+func TestNoStatePathStillWorks(t *testing.T) {
+	s := New(logging.New("test"))
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	if !s.RunOnce() {
+		t.Error("未配置状态文件时仍应正常触发")
+	}
+	if s.RunOnce() {
+		t.Error("同一天不应重复触发")
+	}
+}
+
+// TestClearRunRecord 清除记录后当天可以再触发一次（供 Web "立即执行" 使用）。
+func TestClearRunRecord(t *testing.T) {
+	s := New(logging.New("test"))
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	if !s.RunOnce() {
+		t.Fatal("首次应触发")
+	}
+	if s.RunOnce() {
+		t.Fatal("同一天不应重复触发")
+	}
+
+	s.ClearRunRecord("c1")
+	if !s.RunOnce() {
+		t.Error("清除记录后应可再次触发")
+	}
+}
+
+// TestClearRunRecordPersists 清除也应落盘，否则重启后记录会"复活"。
+func TestClearRunRecordPersists(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "scheduler-state.json")
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath)
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.RunOnce()
+	s.ClearRunRecord("c1")
+
+	data, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	today := time.Now().Format("2006-01-02")
+	if stringsContains(string(data), today) {
+		t.Errorf("清除后状态文件不应再含今天的记录，实际: %s", data)
+	}
+}
+
+// TestSnapshotReflectsRestoredState 重启后 Web 界面看到的"上次执行日期"应正确。
+func TestSnapshotReflectsRestoredState(t *testing.T) {
+	statePath := filepath.Join(t.TempDir(), "scheduler-state.json")
+	today := time.Now().Format("2006-01-02")
+
+	if err := os.WriteFile(statePath, []byte(`{"c1":"`+today+`"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := New(logging.New("test"))
+	s.SetStatePath(statePath)
+	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(time.Hour), Fn: func() {}})
+
+	for _, info := range s.Snapshot(time.Now()) {
+		if info.ID == "c1" {
+			if info.LastRunDate != today {
+				t.Errorf("LastRunDate = %q, 期望 %q", info.LastRunDate, today)
+			}
+			return
+		}
+	}
+	t.Error("未找到任务 c1 的快照")
+}
+
+func stringsContains(haystack, needle string) bool {
+	return len(needle) == 0 || (len(haystack) >= len(needle) && indexOf(haystack, needle) >= 0)
+}
+
+func indexOf(haystack, needle string) int {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return i
+		}
+	}
+	return -1
 }

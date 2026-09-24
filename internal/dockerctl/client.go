@@ -111,27 +111,67 @@ func (c *Client) Available(ctx context.Context) error {
 	return nil
 }
 
-// InspectRunning 判断容器是否处于 running 状态。
-func (c *Client) InspectRunning(ctx context.Context, container string) (bool, error) {
+// ContainerState 是容器运行时状态的快照。
+type ContainerState struct {
+	// Running 表示容器当前是否在运行。
+	Running bool
+	// StartedAt 是本次运行的启动时刻（容器未运行时为零值）。
+	// 用于接管一个"已经在跑"的容器时推断它已运行了多久。
+	StartedAt time.Time
+	// Restarting 表示容器正处于重启过程中。
+	Restarting bool
+}
+
+// InspectState 查询容器的完整运行时状态。
+//
+// 比 InspectRunning 多返回 StartedAt：接管一个本程序启动前就已在运行的容器时，
+// 需要用它推算已运行时长，否则最长运行时长会从接管时刻重新起算，
+// 让一个早就该停的容器继续跑下去。
+func (c *Client) InspectState(ctx context.Context, container string) (ContainerState, error) {
 	body, status, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(container)+"/json", nil)
 	if err != nil {
-		return false, err
+		return ContainerState{}, err
 	}
 	if status == http.StatusNotFound {
-		return false, fmt.Errorf("容器 %s 不存在", container)
+		return ContainerState{}, fmt.Errorf("容器 %s 不存在", container)
 	}
 	if status != http.StatusOK {
-		return false, fmt.Errorf("查询容器 %s 状态失败: HTTP %d %s", container, status, truncate(body))
+		return ContainerState{}, fmt.Errorf("查询容器 %s 状态失败: HTTP %d %s", container, status, truncate(body))
 	}
 	var info struct {
 		State struct {
-			Running bool `json:"Running"`
+			Running    bool   `json:"Running"`
+			Restarting bool   `json:"Restarting"`
+			StartedAt  string `json:"StartedAt"`
 		} `json:"State"`
 	}
 	if err := json.Unmarshal(body, &info); err != nil {
-		return false, fmt.Errorf("解析容器 %s 状态失败: %w", container, err)
+		return ContainerState{}, fmt.Errorf("解析容器 %s 状态失败: %w", container, err)
 	}
-	return info.State.Running, nil
+
+	st := ContainerState{
+		Running:    info.State.Running,
+		Restarting: info.State.Restarting,
+	}
+	// Docker 用 RFC3339Nano 输出，且从未启动过的容器会给零值时间
+	// "0001-01-01T00:00:00Z"。解析失败不算致命，留零值即可。
+	if info.State.StartedAt != "" {
+		if t, perr := time.Parse(time.RFC3339Nano, info.State.StartedAt); perr == nil {
+			st.StartedAt = t
+		} else {
+			c.log.Debug("解析容器 %s 的 StartedAt 失败: %v", container, perr)
+		}
+	}
+	return st, nil
+}
+
+// InspectRunning 判断容器是否处于 running 状态。
+func (c *Client) InspectRunning(ctx context.Context, container string) (bool, error) {
+	st, err := c.InspectState(ctx, container)
+	if err != nil {
+		return false, err
+	}
+	return st.Running, nil
 }
 
 // Start 启动容器。

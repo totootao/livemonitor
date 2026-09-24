@@ -12,6 +12,8 @@ bin/
 config.json
 docker-config/
 data/
+scheduler-state.json
+scheduler-state.json.tmp
 
 # CI 与编辑器配置
 .github/

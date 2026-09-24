@@ -15,7 +15,7 @@ import (
 
 // Runner 抽象 docker 操作，便于测试替换。
 type Runner interface {
-	InspectRunning(ctx context.Context, container string) (bool, error)
+	InspectState(ctx context.Context, container string) (dockerctl.ContainerState, error)
 	Start(ctx context.Context, container string) error
 	Stop(ctx context.Context, container string) error
 	TruncateInternalLogs(ctx context.Context, container string) error
@@ -131,7 +131,19 @@ func (m *ContainerMonitor) Update(cc config.ContainerConfig, globalKeywords []st
 		strings.Join(kw, ", "), config.FormatDuration(cc.MaxRunDuration))
 }
 
-// Start 启动容器；若已在运行则忽略（保留原脚本的幂等语义）。
+// Start 确保容器处于运行状态并纳入监控。
+//
+// 三种情形：
+//   - 容器没在跑           → 启动它，从当前时刻开始计时；
+//   - 容器已在跑且是本程序启动的 → 忽略（幂等）；
+//   - 容器已在跑但**不是**本程序启动的（用户手动起的、上次进程退出后残留的）
+//     → 直接接管监控，不重复下发 start。
+//
+// 第三种情形曾经的处理是"跳过本次计划"，那是个设计错误：
+// 跳过意味着既不做日志关键词监控、也不做超时停止——容器会一直跑下去，
+// 直到有人手动停它。而"容器正在运行"和"今天的计划已经执行过"是两件事，
+// 不能混为一谈。现在改为接管，并按其**真实启动时间**继续计时，
+// 避免一个早就该停的容器因为被接管而重新获得一整轮运行时长。
 func (m *ContainerMonitor) Start() {
 	m.mu.Lock()
 	if m.running {
@@ -141,16 +153,26 @@ func (m *ContainerMonitor) Start() {
 	}
 	m.mu.Unlock()
 
-	// 启动前先看容器真实状态，避免对已运行容器重复 start 造成计时错乱。
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	running, err := m.runner.InspectRunning(ctx, m.name)
+	state, err := m.runner.InspectState(ctx, m.name)
 	cancel()
-	if err == nil && running {
-		m.log.Warn("容器已在运行，本次计划跳过（不影响已有监控）")
-		return
-	}
-	if err != nil {
+
+	adopt := false
+	switch {
+	case err == nil && state.Running:
+		adopt = true
+	case err == nil && state.Restarting:
+		// 重启中：状态的 Running 可能瞬时为 false，此时下发 start 会失败。
+		// 当作已运行处理更稳妥，稍后由日志监控接管。
+		m.log.Warn("容器正在重启中，稍后接管监控")
+		adopt = true
+	case err != nil:
 		m.log.Debug("查询容器状态失败，按未运行处理: %v", err)
+	}
+
+	if adopt {
+		m.adopt(state)
+		return
 	}
 
 	startedAt := time.Now()
@@ -165,6 +187,42 @@ func (m *ContainerMonitor) Start() {
 	}
 	m.log.Info("启动成功")
 
+	m.enterRunning(startedAt)
+}
+
+// adopt 接管一个已经处于运行状态的容器。
+//
+// 计时起点取容器的真实启动时间；该时间不可得时退回当前时刻。
+// 若已运行时长已经超过上限，enforceMaxDuration 会在启动后立即触发停止——
+// 这正是期望行为：这个容器本来就该停了。
+func (m *ContainerMonitor) adopt(state dockerctl.ContainerState) {
+	startedAt := state.StartedAt
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+		m.log.Warn("容器已在运行，但未能取到启动时间，改从当前时刻开始计时")
+	} else {
+		elapsed := time.Since(startedAt)
+		if elapsed < 0 {
+			// 容器时间超前于宿主机（时钟漂移），按当前时刻算，避免负时长。
+			elapsed = 0
+			startedAt = time.Now()
+		}
+		m.mu.Lock()
+		limit := m.maxDuration
+		m.mu.Unlock()
+
+		m.log.Warn("容器已在运行，接管监控（已运行 %s）", config.FormatDuration(int(elapsed.Seconds())))
+		if limit > 0 && elapsed >= limit {
+			m.log.Warn("已运行时长已达上限 %s，接管后将立即停止",
+				config.FormatDuration(int(limit.Seconds())))
+		}
+	}
+
+	m.enterRunning(startedAt)
+}
+
+// enterRunning 把监控器置为运行态并拉起日志监控与超时计时。
+func (m *ContainerMonitor) enterRunning(startedAt time.Time) {
 	runCtx, runCancel := context.WithCancel(context.Background())
 
 	m.mu.Lock()
@@ -314,13 +372,39 @@ func (m *ContainerMonitor) matchAndStop(line string, gen uint64) bool {
 }
 
 // enforceMaxDuration 到达最大运行时长后停止容器。
+//
+// 计时基准是 m.started 而不是"本函数被调用的时刻"。这两者在接管场景下会分叉：
+// 一个两小时前就被用户手动起起来的容器，接管时 m.started 是两小时前，
+// 若按全量 maxDuration 起一个全新定时器，它会被错误地再放行一整轮时长。
+// 因此这里算的是"还剩余多久"，已经超限时剩余为负，立刻触发停止。
 func (m *ContainerMonitor) enforceMaxDuration(ctx context.Context, gen uint64, done chan struct{}) {
 	m.mu.Lock()
 	maxDuration := m.maxDuration
+	started := m.started
 	m.mu.Unlock()
 
-	m.log.Info("将在 %s 后自动停止", config.FormatDuration(int(maxDuration.Seconds())))
-	timer := time.NewTimer(maxDuration)
+	if maxDuration < 0 {
+		// 负值表示显式关闭超时（配置层通常已把非正值归一化为默认值，
+		// 这里只兜底），只等上下文结束。
+		<-ctx.Done()
+		return
+	}
+	// 注意：maxDuration == 0 不是"不限时长"，而是"到点即停"。
+	// 配置里 <=0 会被归一化成 DefaultMaxRunDuration，真正走到这里为 0 的
+	// 只剩亚秒级的测试用例——它们期望立刻停，而不是永远不停。
+
+	remaining := time.Until(started.Add(maxDuration))
+	if remaining < 0 {
+		remaining = 0
+	}
+
+	if remaining == 0 {
+		m.log.Warn("容器已运行满 %s，立即停止", config.FormatDuration(int(maxDuration.Seconds())))
+	} else {
+		m.log.Info("将在 %s 后自动停止", config.FormatDuration(int(remaining.Seconds())))
+	}
+
+	timer := time.NewTimer(remaining)
 	defer timer.Stop()
 
 	select {

@@ -13,12 +13,18 @@
 #   IMAGE=livemonitor:test bash scripts/e2e.sh
 #   BUILD=1 bash scripts/e2e.sh             # 先构建再测
 #
+# 网络受限时（如 CI 沙箱）可追加构建参数，无需改动 Dockerfile：
+#   BUILD=1 EXTRA_BUILD_ARGS="--build-arg GOPROXY=https://goproxy.cn,direct" bash scripts/e2e.sh
+#
 # 依赖：docker、curl、python3。（ffmpeg 可选——仅用于生成测试音频素材，
 # 缺失时自动降级为用本仓库的转码器自身生成。）
 set -uo pipefail
 
 IMAGE="${IMAGE:-totootao/livemonitor:latest}"
 BUILD="${BUILD:-0}"
+# EXTRA_BUILD_ARGS 会原样透传给 docker build，用于在网络受限环境覆盖
+# GOPROXY / apk 镜像源等。默认留空，保证正常环境下行为不变。
+EXTRA_BUILD_ARGS="${EXTRA_BUILD_ARGS:-}"
 # 被测容器与"被监控的目标容器"的命名前缀，统一便于清理。
 PREFIX="${PREFIX:-lme2e}"
 SVC="${PREFIX}-svc"
@@ -50,10 +56,21 @@ must() {
   return 1
 }
 
+# 判断字符串是否包含子串。见 must_contain 的注释：不要用管道 + grep -q。
+contains() {
+  [[ "$1" == *"$2"* ]]
+}
+
 # 断言字符串包含子串。
+#
+# 这里刻意不用 `printf ... | grep -qF` 的管道写法，尽管它更短。
+# 原因是脚本开启了 pipefail：`grep -q` 一旦命中就立即退出并关闭管道，
+# 上游 printf 随即收到 SIGPIPE，管道整体返回非零，`if` 于是走进 else 分支，
+# 把"明明命中了"判成失败。载荷越大越容易触发——首页 HTML 就是第一个踩中的。
+# 改用 bash 内置的子串判断，没有外部进程、没有管道，也就没有这个问题。
 must_contain() {
   local desc="$1" haystack="$2" needle="$3"
-  if printf '%s' "$haystack" | grep -qF -- "$needle"; then
+  if contains "$haystack" "$needle"; then
     c_ok "$desc"
   else
     c_bad "$desc（未找到: $needle）"
@@ -81,8 +98,9 @@ fi
 c_ok "docker 可用（Engine $(docker version --format '{{.Server.Version}}'))"
 
 if [ "$BUILD" = "1" ]; then
-  echo "  正在构建镜像 $IMAGE ..."
-  if ! docker build -t "$IMAGE" . >"$WORK/build.log" 2>&1; then
+  echo "  正在构建镜像 $IMAGE ${EXTRA_BUILD_ARGS:+（附加参数: $EXTRA_BUILD_ARGS）} ..."
+  # shellcheck disable=SC2086 # 有意按空格拆分 EXTRA_BUILD_ARGS
+  if ! docker build -t "$IMAGE" $EXTRA_BUILD_ARGS . >"$WORK/build.log" 2>&1; then
     echo "  构建失败，日志尾部：" >&2
     tail -25 "$WORK/build.log" >&2
     exit 1
@@ -216,7 +234,7 @@ must "init 生成默认配置" \
 # 再 init 一次应被拒绝（不覆盖已有配置）。
 AGAIN=$(docker run --rm -v "$WORK/config:/config" \
   --entrypoint livemonitor "$IMAGE" init -config /config/config.json 2>&1)
-if printf '%s' "$AGAIN" | grep -q "已存在"; then
+if contains "$AGAIN" "已存在"; then
   c_ok "重复 init 被拒绝（不覆盖已有配置）"
 else
   c_bad "重复 init 未按预期拒绝"
@@ -342,7 +360,7 @@ fi
 # 判定依据是"有没有对它发起转换"，而不是日志里出现过文件名——
 # 后者太宽，"发现待转换"和"开始转换"都可能出现在不相干的上下文里。
 if [ -f "$WORK/audio/low.mp3" ]; then
-  if printf '%s' "$SVC_LOG" | grep -q "开始转换: low.mp3"; then
+  if contains "$SVC_LOG" "开始转换: low.mp3"; then
     c_bad "低于阈值的 low.mp3 被误处理（应跳过）"
   else
     c_ok "低于阈值的 low.mp3 被正确跳过"
@@ -360,7 +378,7 @@ if [ "$have_ffmpeg" = "1" ]; then
   # 等到下一轮扫描处理完（扫描间隔 2s，留足余量）。
   sleep 8
   SVC_LOG=$(docker logs "$SVC" 2>&1)
-  if printf '%s' "$SVC_LOG" | grep -q "开始转换: xing32.mp3"; then
+  if contains "$SVC_LOG" "开始转换: xing32.mp3"; then
     c_bad "带 Xing 信息帧的 32k 文件被误判为重编码（回归 bug）"
   else
     c_ok "带 Xing 信息帧的 32k 文件未被误压（信息帧已正确跳过）"
@@ -368,8 +386,8 @@ if [ "$have_ffmpeg" = "1" ]; then
 fi
 
 # 损坏文件应报错但不影响服务继续运行。
-if printf '%s' "$SVC_LOG" | grep -q "broken.mp3"; then
-  if printf '%s' "$SVC_LOG" | grep -q "无法解码.*broken.mp3\|解析 MP3 失败"; then
+if contains "$SVC_LOG" "broken.mp3"; then
+  if contains "$SVC_LOG" "解析 MP3 失败" || contains "$SVC_LOG" "无法解码"; then
     c_ok "损坏的 broken.mp3 被识别并跳过"
   else
     c_bad "broken.mp3 被处理但未见明确的错误说明"
@@ -453,6 +471,129 @@ must_contain "目标容器在持续输出日志" "$TARGET_LOG" "tick"
 
 # 通过 Engine API 停止它——这一步不经过 docker CLI，验证纯 HTTP 实现。
 must "dockerctl 可停止容器" docker stop "$TARGET"
+
+# ---------- 7.5 接管已运行容器 & 重启不重放 ----------
+#
+# 这一段覆盖两个曾经真实发生在生产环境的缺陷：
+#   1) 容器已处于运行状态时，程序把它当作"本次计划跳过"——
+#      既不监控日志也不做超时停止，容器会一直跑到有人手动停它。
+#   2) "今天是否已执行"只存在内存里，进程重启或配置热更新后当天已过点的
+#      任务会被重放，表现为同一批容器在几分钟内被反复启动。
+
+section "7.5 接管已运行容器与重启不重放"
+
+# 用一个专门的服务实例，避免污染前面几节的状态。
+ADOPT_PREFIX="${PREFIX}-adopt"
+ADOPT_CFG="$WORK/adopt/config"
+mkdir -p "$ADOPT_CFG"
+
+# 目标容器先手动起起来（模拟"用户自己起的 / 上次残留的"），再启动服务。
+ADOPT_TARGET="${ADOPT_PREFIX}-target"
+docker rm -f "$ADOPT_TARGET" >/dev/null 2>&1
+docker run -d --name "$ADOPT_TARGET" alpine:3.22 sh -c \
+  'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 1; done' >/dev/null 2>&1
+
+# 计划时刻设为已过点（用当前时间减 1 分钟），让任务在服务启动后立即到点。
+PAST_HHMM=$(date -d '1 minute ago' '+%H:%M')
+cat > "$ADOPT_CFG/config.json" << EOF
+{
+  "watch_dir": "$WORK/adopt/audio",
+  "mp3_bitrate": "32k",
+  "check_interval": 3600,
+  "monitor_keywords": "等待直播",
+  "containers": [{
+    "name": "$ADOPT_TARGET",
+    "start_times": "$PAST_HHMM",
+    "max_run_duration": 3600,
+    "keywords": "等待直播"
+  }]
+}
+EOF
+mkdir -p "$WORK/adopt/audio"
+
+ADOPT_SVC="${ADOPT_PREFIX}-svc"
+docker rm -f "$ADOPT_SVC" >/dev/null 2>&1
+docker run -d --name "$ADOPT_SVC" -p 18081:8080 \
+  -v "$ADOPT_CFG:/config" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e LIVEMONITOR_CONFIG=/config/config.json \
+  "$IMAGE" >/dev/null 2>&1
+
+# 等到调度器至少轮询过一轮（tick 1s），且日志监控已挂上。
+adopted=0
+for _ in $(seq 1 20); do
+  if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "接管监控"; then
+    adopted=1; break
+  fi
+  sleep 1
+done
+
+ADOPT_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
+if [ "$adopted" = "1" ]; then
+  c_ok "已运行的容器被接管（而非跳过）"
+else
+  c_bad "已运行的容器未被接管"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$ADOPT_LOG" | tail -6 | sed 's/^/            /')"
+fi
+
+# 旧的错误行为会打出这句。它不该再出现。
+if contains "$ADOPT_LOG" "本次计划跳过"; then
+  c_bad "仍在用旧的\"计划跳过\"行为（应改为接管）"
+else
+  c_ok "不再出现\"本次计划跳过\""
+fi
+
+# 接管后必须真的挂上了日志监控——这是"接管"与"跳过"的实质区别。
+if contains "$ADOPT_LOG" "开始监控新日志"; then
+  c_ok "接管后日志关键词监控已启动"
+else
+  c_bad "接管后未启动日志关键词监控"
+fi
+
+# 状态文件应落到配置文件旁边，且记下当天已执行。
+STATE_FILE="$ADOPT_CFG/scheduler-state.json"
+today="$(date '+%Y-%m-%d')"
+state_ok=0
+for _ in $(seq 1 10); do
+  if [ -f "$STATE_FILE" ] && contains "$(cat "$STATE_FILE" 2>/dev/null)" "$today"; then
+    state_ok=1; break
+  fi
+  sleep 1
+done
+if [ "$state_ok" = "1" ]; then
+  c_ok "调度状态已落盘（scheduler-state.json 含今天）"
+else
+  c_bad "调度状态未落盘"
+  printf '      \033[2m文件内容: %s\033[0m\n' "$(cat "$STATE_FILE" 2>/dev/null | head -5 | sed 's/^/            /')"
+fi
+
+# 核心回归：重启服务后，当天已过点的任务不能再触发一次。
+docker restart "$ADOPT_SVC" >/dev/null 2>&1
+sleep 6
+RESTART_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
+
+if contains "$RESTART_LOG" "已恢复当天的调度记录"; then
+  c_ok "重启后恢复了当天的调度记录"
+else
+  c_bad "重启后未恢复调度记录"
+fi
+
+# "触发定时任务"在两次启动中合计只应出现一次。
+# 下限也一并断言：如果一次都没触发（比如服务压根没起来），
+# 这个用例就会因为"0 <= 1"而假通过，掩盖真正的启动失败。
+trigger_count=$(printf '%s' "$RESTART_LOG" | grep -c "触发定时任务" || true)
+trigger_count="${trigger_count:-0}"
+if [ "$trigger_count" -eq 1 ]; then
+  c_ok "当天任务恰好触发一次，重启未重放"
+elif [ "$trigger_count" -eq 0 ]; then
+  c_bad "任务一次都没触发（服务可能未正常启动）"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$RESTART_LOG" | tail -8 | sed 's/^/            /')"
+else
+  c_bad "重启后重放了任务，触发 $trigger_count 次（期望 1）"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$RESTART_LOG" | grep "触发定时任务" | head -5 | sed 's/^/            /')"
+fi
+
+docker rm -f "$ADOPT_SVC" "$ADOPT_TARGET" >/dev/null 2>&1
 
 # ---------- 8. 优雅退出 ----------
 

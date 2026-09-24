@@ -6,6 +6,10 @@
 /config.json
 /data/
 
+# 调度器的当天触发记录（运行时状态，跟着配置文件走）
+/scheduler-state.json
+scheduler-state.json
+
 # 测试与覆盖率产物
 *.out
 coverage.html

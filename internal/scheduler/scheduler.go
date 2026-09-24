@@ -3,6 +3,11 @@ package scheduler
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -31,11 +36,21 @@ type Scheduler struct {
 	tick  time.Duration
 	loc   *time.Location
 	nowFn func() time.Time
+
+	// statePath 是触发记录的落盘路径，为空表示不持久化。
+	statePath string
+	// fired 记录每个任务最近一次触发的日期（任务 ID -> YYYY-MM-DD）。
+	//
+	// 必须持久化的原因：这个字段是"今天是否已执行"的唯一依据。放在内存里的话，
+	// 进程重启或任何配置热更新（Reload 会重建 Job 对象）都会把它清零，
+	// 导致当天所有已过点的任务被重放一遍——表现为同一容器在几分钟内被反复启动。
+	fired map[string]string
 }
 
 type scheduledJob struct {
 	Job
-	lastRunDate string // YYYY-MM-DD，避免同一分钟重复触发
+	// lastRunDate 是当天是否已触发的运行时快照，真值以 Scheduler.fired 为准。
+	lastRunDate string
 }
 
 // New 创建调度器。
@@ -45,6 +60,90 @@ func New(log *logging.Logger) *Scheduler {
 		tick:  time.Second,
 		loc:   time.Local,
 		nowFn: time.Now,
+		fired: make(map[string]string),
+	}
+}
+
+// SetStatePath 设置触发记录的持久化路径，并立即载入已有记录。
+//
+// 载入失败不算致命：最坏情况是当天任务被重放一次，比让整个服务起不来要好。
+func (s *Scheduler) SetStatePath(path string) {
+	s.mu.Lock()
+	s.statePath = path
+	s.mu.Unlock()
+	s.loadState()
+}
+
+// loadState 从磁盘读回触发记录，只保留当天的条目。
+func (s *Scheduler) loadState() {
+	s.mu.Lock()
+	path := s.statePath
+	s.mu.Unlock()
+	if path == "" {
+		return
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, fs.ErrNotExist) {
+			s.log.Warn("读取调度状态失败（将按未执行处理）: %v", err)
+		}
+		return
+	}
+	var saved map[string]string
+	if err := json.Unmarshal(data, &saved); err != nil {
+		s.log.Warn("解析调度状态失败（将按未执行处理）: %v", err)
+		return
+	}
+
+	// 只接受今天的记录。昨天的记录没有意义，留着反而会干扰日期比较。
+	today := s.nowFn().Format("2006-01-02")
+	s.mu.Lock()
+	kept := 0
+	for id, date := range saved {
+		if date == today {
+			s.fired[id] = date
+			kept++
+		}
+	}
+	s.mu.Unlock()
+
+	if kept > 0 {
+		s.log.Info("已恢复当天的调度记录：%d 个任务今天已执行", kept)
+	}
+}
+
+// saveState 把触发记录写回磁盘（原子替换，避免写一半时进程退出导致文件损坏）。
+func (s *Scheduler) saveState() {
+	s.mu.Lock()
+	path := s.statePath
+	if path == "" {
+		s.mu.Unlock()
+		return
+	}
+	snapshot := make(map[string]string, len(s.fired))
+	for id, date := range s.fired {
+		snapshot[id] = date
+	}
+	s.mu.Unlock()
+
+	data, err := json.MarshalIndent(snapshot, "", "  ")
+	if err != nil {
+		s.log.Warn("序列化调度状态失败: %v", err)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		s.log.Warn("创建调度状态目录失败: %v", err)
+		return
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		s.log.Warn("写入调度状态失败: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		s.log.Warn("替换调度状态文件失败: %v", err)
+		_ = os.Remove(tmp)
 	}
 }
 
@@ -66,18 +165,26 @@ func (s *Scheduler) SetTick(d time.Duration) {
 }
 
 // Add 注册一个每日任务。
-// 若已存在相同 ID 的任务，则原地替换，避免热更新时产生重复触发。
+// 若已存在相同 ID 的任务，则原地替换，同时**保留其触发记录**——
+// 热更新配置时不应该让今天已经执行过的任务重新获得触发机会。
 func (s *Scheduler) Add(job Job) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	var lastRun string
+	if job.ID != "" {
+		lastRun = s.fired[job.ID]
+	}
+	entry := &scheduledJob{Job: job, lastRunDate: lastRun}
+
 	for i, existing := range s.jobs {
 		if job.ID != "" && existing.ID == job.ID {
-			s.jobs[i] = &scheduledJob{Job: job}
+			s.jobs[i] = entry
 			s.sortLocked()
 			return
 		}
 	}
-	s.jobs = append(s.jobs, &scheduledJob{Job: job})
+	s.jobs = append(s.jobs, entry)
 	s.sortLocked()
 }
 
@@ -103,6 +210,22 @@ func (s *Scheduler) RemoveByPrefix(prefix string) int {
 	}
 	s.jobs = kept
 	return removed
+}
+
+// ClearRunRecord 清除某个任务今天的触发记录，让它当天可以再次触发。
+//
+// 用途：Web 界面的"立即执行"是人的显式意图，不该被"今天已经跑过"挡住。
+// 调用后任务在下一次轮询时若已过点便立即触发。
+func (s *Scheduler) ClearRunRecord(id string) {
+	s.mu.Lock()
+	delete(s.fired, id)
+	for _, j := range s.jobs {
+		if j.ID == id {
+			j.lastRunDate = ""
+		}
+	}
+	s.mu.Unlock()
+	s.saveState()
 }
 
 // Reset 清空全部任务。
@@ -144,16 +267,67 @@ func (s *Scheduler) Snapshot(now time.Time) []JobInfo {
 		if !target.After(now) {
 			target = target.Add(24 * time.Hour)
 		}
+		lastRun := j.lastRunDate
+		if v, ok := s.fired[j.ID]; ok {
+			lastRun = v
+		}
 		out = append(out, JobInfo{
 			ID:          j.ID,
 			Name:        j.Name,
 			Time:        j.At.Format("15:04"),
-			LastRunDate: j.lastRunDate,
+			LastRunDate: lastRun,
 			NextRun:     target,
 		})
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Time < out[j].Time })
 	return out
+}
+
+// RunOnce 同步执行一轮到点检查，返回是否触发了任务。
+//
+// 生产代码走 Run 的定时轮询；这个入口供测试使用，让"是否重放"这类断言
+// 不必依赖 sleep 去等一个轮询周期。
+//
+// 实现上刻意只做两件事：给任务函数套一层"完成即上报"的包装，
+// 然后原样调用 runPending。判定逻辑一律复用生产路径——
+// 如果这里另写一份"是否到点"的判断（比如再查一次 s.fired），
+// 测出来的就是测试自己的逻辑而不是线上那套，会出现"测试全绿但 bug 仍在"。
+// 这个坑踩过一次：早期版本自带 isDueLocked，回退生产代码后测试依然通过。
+func (s *Scheduler) RunOnce() bool {
+	done := make(chan struct{}, 64)
+
+	s.mu.Lock()
+	for _, j := range s.jobs {
+		inner := j.Fn
+		name := j.Name
+		j.Fn = func() {
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("定时任务 %s 发生 panic: %v", name, r)
+				}
+				done <- struct{}{}
+			}()
+			inner()
+		}
+	}
+	s.mu.Unlock()
+
+	s.runPending()
+
+	// runPending 对每个到点任务起一个 goroutine，这里用"静默窗口"收敛：
+	// 等到至少一次上报后，再静默一小会儿就认为本轮没有更多任务了。
+	select {
+	case <-done:
+		for {
+			select {
+			case <-done:
+			case <-time.After(20 * time.Millisecond):
+				return true
+			}
+		}
+	case <-time.After(50 * time.Millisecond):
+		return false
+	}
 }
 
 // Run 阻塞运行调度循环，直到 ctx 被取消。
@@ -180,6 +354,11 @@ func (s *Scheduler) runPending() {
 	s.mu.Lock()
 	var due []*scheduledJob
 	for _, j := range s.jobs {
+		// 真值以 fired 为准：它可能来自上一次进程运行或上一次配置热更新。
+		if last, ok := s.fired[j.ID]; ok && last == dateKey {
+			j.lastRunDate = last
+			continue
+		}
 		if j.lastRunDate == dateKey {
 			continue
 		}
@@ -189,10 +368,20 @@ func (s *Scheduler) runPending() {
 		if !now.Before(target) {
 			// 已过点（含轮询导致的轻微延迟），当天只触发一次。
 			j.lastRunDate = dateKey
+			if j.ID != "" {
+				s.fired[j.ID] = dateKey
+			}
 			due = append(due, j)
 		}
 	}
 	s.mu.Unlock()
+
+	if len(due) == 0 {
+		return
+	}
+	// 先落盘再执行：万一下游 panic 或进程被杀，也已经记下"今天跑过了"，
+	// 不至于重启后又来一遍。
+	s.saveState()
 
 	for _, j := range due {
 		s.log.Info("触发定时任务: %s (计划时刻 %s)", j.Name, j.At.Format("15:04:05"))

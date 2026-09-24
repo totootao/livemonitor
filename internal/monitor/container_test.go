@@ -37,19 +37,30 @@ type fakeRunner struct {
 	stopped   int
 	truncated int
 	rotated   int
+	// running 是未设置 inspectFn/inspectStateFn 时的默认容器状态。
+	// 默认 false 表示容器不存在；之所以不选择"调 Start 就变 true"，
+	// 是为了让 Start 内部的 InspectState 与随后的 Start 两个调用语义清晰分离。
+	running   bool
 	inspectFn func() (bool, error)
-	streams   []*fakeStream
-	startErr  error
-	stopErr   error
+	// inspectStateFn 优先于 inspectFn，便于构造带启动时间的状态。
+	inspectStateFn func() (dockerctl.ContainerState, error)
+	streams        []*fakeStream
+	startErr       error
+	stopErr        error
 }
 
 func newFakeRunner() *fakeRunner { return &fakeRunner{} }
 
-func (f *fakeRunner) InspectRunning(ctx context.Context, container string) (bool, error) {
-	if f.inspectFn != nil {
-		return f.inspectFn()
+func (f *fakeRunner) InspectState(ctx context.Context, container string) (dockerctl.ContainerState, error) {
+	if f.inspectStateFn != nil {
+		return f.inspectStateFn()
 	}
-	return false, nil
+	if f.inspectFn != nil {
+		running, err := f.inspectFn()
+		return dockerctl.ContainerState{Running: running}, err
+	}
+	// 默认容器不存在（Running=false），等价于旧行为。
+	return dockerctl.ContainerState{Running: f.running}, nil
 }
 
 func (f *fakeRunner) Start(ctx context.Context, container string) error {
@@ -219,6 +230,12 @@ func TestNonMatchingKeywordKeepsRunning(t *testing.T) {
 // TestMaxDurationStopsContainer 到达最大运行时长应停止容器。
 func TestMaxDurationStopsContainer(t *testing.T) {
 	fn := newFakeRunner()
+	// 关键：让 InspectState 返回"没在运行"，Start 才会真的走启动分支。
+	// 若返回 Running=true，Start 会走接管分支，把一个零值 StartedAt 当作
+	// 刚刚启动，计时起点就变成了测试随机时间而非本次启动。
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		return dockerctl.ContainerState{}, nil
+	}
 	m := newTestMonitor(t, fn, []string{"等待直播"}, 150*time.Millisecond)
 
 	stoppedCh := make(chan string, 1)
@@ -292,21 +309,120 @@ func TestStopFailureRollsBack(t *testing.T) {
 	}
 }
 
-// TestInspectRunningSkipsStart 容器已在运行时应跳过本次启动计划。
-func TestInspectRunningSkipsStart(t *testing.T) {
+// TestRunningContainerAdopted 容器已在运行时应接管监控，而不是跳过。
+//
+// 历史行为是"跳过本次计划"，那是错的：跳过意味着既不做日志关键词监控、
+// 也不做超时停止，容器会一直跑到有人手动停它。
+// "容器正在运行"与"今天的计划已执行过"是两件事，不能混为一谈。
+func TestRunningContainerAdopted(t *testing.T) {
 	fn := newFakeRunner()
-	fn.inspectFn = func() (bool, error) { return true, nil }
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		return dockerctl.ContainerState{Running: true, StartedAt: time.Now().Add(-10 * time.Minute)}, nil
+	}
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+
+	startedAt := make(chan time.Time, 1)
+	m.SetHooks(func(at time.Time) { startedAt <- at }, nil)
+
+	m.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	// 不应重复下发 start。
+	started, _, _, _ := fn.counts()
+	if started != 0 {
+		t.Errorf("接管已在运行的容器时不应再 start，实际 %d 次", started)
+	}
+
+	// 但必须进入运行态，从而挂上日志监控与超时计时。
+	if !m.IsRunning() {
+		t.Fatal("接管后应处于运行中状态（否则不会做关键词监控与超时停止）")
+	}
+
+	// 计时起点必须是容器的真实启动时间，而不是接管时刻。
+	select {
+	case at := <-startedAt:
+		if time.Since(at) < 9*time.Minute {
+			t.Errorf("计时起点应取容器真实启动时间（约 10 分钟前），实际距今仅 %s", time.Since(at))
+		}
+	default:
+		t.Error("接管应触发 onStarted 回调")
+	}
+}
+
+// TestAdoptContainerPastLimit 已运行超限的容器被接管后应立即停止。
+func TestAdoptContainerPastLimit(t *testing.T) {
+	fn := newFakeRunner()
+	// 容器已经跑了 2 小时，而上限是 1 小时。
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		return dockerctl.ContainerState{Running: true, StartedAt: time.Now().Add(-2 * time.Hour)}, nil
+	}
 	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
 
 	m.Start()
-	time.Sleep(100 * time.Millisecond)
+	time.Sleep(250 * time.Millisecond)
 
-	started, _, _, _ := fn.counts()
-	if started != 0 {
-		t.Errorf("容器已在运行时不应再次 start，实际 %d 次", started)
+	_, stopped, _, _ := fn.counts()
+	if stopped == 0 {
+		t.Error("已运行超过上限的容器被接管后应立即停止")
 	}
 	if m.IsRunning() {
-		t.Error("跳过启动时不应标记为运行中")
+		t.Error("停止后不应仍处于运行态")
+	}
+}
+
+// TestAdoptWithoutStartedAt 取不到启动时间时退回当前时刻，不应崩溃。
+func TestAdoptWithoutStartedAt(t *testing.T) {
+	fn := newFakeRunner()
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		// StartedAt 为零值，模拟 Docker 未返回该字段。
+		return dockerctl.ContainerState{Running: true}, nil
+	}
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+
+	m.Start()
+	time.Sleep(150 * time.Millisecond)
+
+	if !m.IsRunning() {
+		t.Fatal("取不到启动时间时仍应接管并进入运行态")
+	}
+	_, stopped, _, _ := fn.counts()
+	if stopped != 0 {
+		t.Error("计时从当前时刻起算，不应立刻停止")
+	}
+}
+
+// TestRunningContainerKeywordStillWorks 接管后的容器同样受关键词监控。
+//
+// 这是修复的核心价值：接管不只是"记一笔"，而是真正挂上日志监控。
+func TestRunningContainerKeywordStillWorks(t *testing.T) {
+	fn := newFakeRunner()
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		return dockerctl.ContainerState{Running: true, StartedAt: time.Now()}, nil
+	}
+
+	stoppedCh := make(chan string, 1)
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+	m.SetHooks(nil, func(reason string) { stoppedCh <- reason })
+
+	m.Start()
+	m.waitRunning(t)
+
+	// 接管路径同样应建立日志流。
+	stream := fn.lastStream(t)
+	stream.Push("[INFO] 主播正在准备，等待直播中")
+
+	select {
+	case reason := <-stoppedCh:
+		if !strings.Contains(reason, "等待直播") {
+			t.Errorf("停止原因应包含关键词，实际: %s", reason)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("接管后的容器应受关键词监控，但超时未停止")
+	}
+
+	_, stopped, _, _ := fn.counts()
+	if stopped != 1 {
+		t.Errorf("stop 调用次数 = %d, 期望 1", stopped)
 	}
 }
 

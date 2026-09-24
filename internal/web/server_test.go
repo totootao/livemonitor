@@ -288,8 +288,8 @@ func TestStateShowsMonitorWithoutConfig(t *testing.T) {
 // noopRunner 是满足 monitor.Runner 的空实现，仅用于构造监控器以便测试状态聚合。
 type noopRunner struct{}
 
-func (noopRunner) InspectRunning(ctx context.Context, container string) (bool, error) {
-	return false, nil
+func (noopRunner) InspectState(ctx context.Context, container string) (dockerctl.ContainerState, error) {
+	return dockerctl.ContainerState{}, nil
 }
 func (noopRunner) Start(ctx context.Context, container string) error                { return nil }
 func (noopRunner) Stop(ctx context.Context, container string) error                 { return nil }

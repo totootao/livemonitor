@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
 	"sync"
 	"syscall"
@@ -68,12 +69,29 @@ func New(cfg *config.Config, cfgPath string, log *logging.Logger) (*Manager, err
 		monitors: make(map[string]*monitor.ContainerMonitor),
 	}
 
+	// 把"今天已触发过哪些任务"落盘到配置目录旁。
+	//
+	// 不持久化的话，进程重启或任何配置热更新都会让当天已过点的任务重放一遍，
+	// 表现为同一批容器在几分钟内被反复启动。
+	// 路径跟着配置文件走，不额外引入新的挂载点。
+	m.sched.SetStatePath(schedulerStatePath(cfgPath))
+
 	// 按配置初始化全部容器与定时任务。
 	for _, cc := range cfg.Containers {
 		m.installContainer(cc, cfg.MonitorKeywords)
 	}
 
 	return m, nil
+}
+
+// schedulerStatePath 由配置文件路径推导调度状态文件的位置。
+// 配置文件形如 /config/config.json，状态文件落在 /config/scheduler-state.json。
+func schedulerStatePath(cfgPath string) string {
+	dir := filepath.Dir(cfgPath)
+	if dir == "" || dir == "." {
+		return "scheduler-state.json"
+	}
+	return filepath.Join(dir, "scheduler-state.json")
 }
 
 // installContainer 创建（或复用）容器监控器并注册其定时任务。调用方不应持有 m.mu。
