@@ -54,8 +54,18 @@ trap cleanup EXIT
 
 fail() {
   echo "::error::$1"
-  echo "--- 服务日志 ---"
+  echo "--- 服务日志 ($SERVER_LOG) ---"
   cat "$SERVER_LOG" 2>/dev/null || echo "(无日志)"
+  echo "--- 配置内容 ---"
+  cat "$CONFIG" 2>/dev/null || echo "(无配置)"
+  echo "--- 进程状态 ---"
+  echo "SRV_PID=$SRV_PID"
+  # 失败时把日志逐行转成注解，保证在受限网络下也能通过 API 取到诊断信息。
+  if [ -s "$SERVER_LOG" ]; then
+    while IFS= read -r line; do
+      echo "::error::log: $line"
+    done <"$SERVER_LOG"
+  fi
   exit 1
 }
 
