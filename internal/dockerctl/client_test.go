@@ -416,8 +416,102 @@ func TestLogsFollowPassesSince(t *testing.T) {
 	if !strings.Contains(gotQuery, "follow=1") {
 		t.Errorf("应带上 follow=1，实际 query: %s", gotQuery)
 	}
+	// tail=0 的语义是"0 行历史"，与 since 同用会把要回放的历史全部吞掉
+	// （Engine 先按 tail 截断、再按 since 过滤），这是"监控不到启动初期
+	// 日志"的根因。带 since 的请求绝不能再带 tail。
+	if strings.Contains(gotQuery, "tail=") {
+		t.Errorf("带 since 时不应携带 tail 参数，实际 query: %s", gotQuery)
+	}
+}
+
+// 不带 since 时应保留 tail=0：只跟踪新产生的日志，不要历史。
+func TestLogsFollowWithoutSinceKeepsTailZero(t *testing.T) {
+	f := newFakeEngine(t)
+	var gotQuery string
+	f.on(http.MethodGet, "/containers/zhangsan/logs", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	})
+	if _, err := f.client().LogsFollow(context.Background(), "zhangsan", nil); err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
 	if !strings.Contains(gotQuery, "tail=0") {
-		t.Errorf("应带上 tail=0，实际 query: %s", gotQuery)
+		t.Errorf("since 为 nil 时应带 tail=0，实际 query: %s", gotQuery)
+	}
+	if strings.Contains(gotQuery, "since=") {
+		t.Errorf("since 为 nil 时不应带 since，实际 query: %s", gotQuery)
+	}
+}
+
+// 带 since 的实时流必须回放 since 以来的历史日志——容器启动瞬间打印的
+// 关键词发生在日志流建立之前，不回放就永远监控不到。
+func TestLogsFollowReplaysHistorySince(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/zhangsan/json", http.StatusOK,
+		map[string]any{"Config": map[string]any{"Tty": false}})
+	f.on(http.MethodGet, "/containers/zhangsan/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		writeFrame(w, "等待直播\n")
+		writeFrame(w, "第二行\n")
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-time.After(2 * time.Second)
+	})
+	h, err := f.client().LogsFollow(context.Background(), "zhangsan", nil)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	defer func() { _ = h.Kill() }()
+	want := []string{"等待直播", "第二行"}
+	for _, w := range want {
+		select {
+		case got, ok := <-h.Lines():
+			if !ok {
+				t.Fatalf("日志通道提前关闭，想要 %q", w)
+			}
+			if got != w {
+				t.Fatalf("应收到 %q，实际 %q", w, got)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("3 秒内未收到 %q", w)
+		}
+	}
+}
+
+// TTY 容器（docker run -t）的日志流没有 8 字节帧头，必须按原始行读取；
+// 按帧解析会把文本当帧长，一行都解不出来。
+func TestLogsFollowTTYRawStream(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/ttyc/json", http.StatusOK,
+		map[string]any{"Config": map[string]any{"Tty": true}})
+	f.on(http.MethodGet, "/containers/ttyc/logs", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		// 原始字节流：无帧头，直接是日志文本。
+		_, _ = w.Write([]byte("等待直播\nsecond\r\n"))
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		<-time.After(2 * time.Second)
+	})
+	h, err := f.client().LogsFollow(context.Background(), "ttyc", nil)
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	defer func() { _ = h.Kill() }()
+	want := []string{"等待直播", "second"} // \r\n 应被剥掉
+	for _, w := range want {
+		select {
+		case got, ok := <-h.Lines():
+			if !ok {
+				t.Fatalf("日志通道提前关闭，想要 %q", w)
+			}
+			if got != w {
+				t.Fatalf("应收到 %q，实际 %q", w, got)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("3 秒内未收到 %q", w)
+		}
 	}
 }
 
@@ -540,7 +634,8 @@ func TestLogsRangeParsesFrames(t *testing.T) {
 	}
 }
 
-// 请求参数：follow=0 且带 since。
+// 请求参数：follow=0 且带 since；绝不携带 tail——tail=0 会把要回查的
+// 历史全部吞掉，让启动回溯检查永远返回空。
 func TestLogsRangePassesParams(t *testing.T) {
 	f := newFakeEngine(t)
 	var gotQuery string
@@ -557,6 +652,33 @@ func TestLogsRangePassesParams(t *testing.T) {
 	}
 	if !strings.Contains(gotQuery, "follow=0") {
 		t.Errorf("回读不应跟随，应带 follow=0，实际 query: %s", gotQuery)
+	}
+	if strings.Contains(gotQuery, "tail=") {
+		t.Errorf("回查不应携带 tail 参数，实际 query: %s", gotQuery)
+	}
+}
+
+// TTY 容器的日志流没有帧头，回查应按原始行读取而不是按帧解复用。
+func TestLogsRangeTTYRawStream(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/ttyc/json", http.StatusOK,
+		map[string]any{"Config": map[string]any{"Tty": true}})
+	f.on(http.MethodGet, "/containers/ttyc/logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("等待直播\n第二行\r\n"))
+	})
+	lines, err := f.client().LogsRange(context.Background(), "ttyc", time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	want := []string{"等待直播", "第二行"}
+	if len(lines) != len(want) {
+		t.Fatalf("应返回 %d 行，实际 %d 行: %v", len(want), len(lines), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("第 %d 行应为 %q，实际 %q", i, want[i], lines[i])
+		}
 	}
 }
 

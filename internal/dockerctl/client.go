@@ -231,7 +231,15 @@ func (c *Client) RotateLogs(ctx context.Context, container string) error {
 }
 
 // LogsFollow 以流式方式跟踪容器日志。
-// since 为 nil 时使用 tail=0 只跟踪新产生的日志。
+//
+// since 非 nil 时从该时刻起**回放全部历史再转入跟随**——这是关键词监控
+// 的生命线：容器启动瞬间就可能打出关键词（比如应用一上来就打印
+// "等待直播"），而日志流建立总要晚于 docker start 返回，不回放就漏。
+// since 为 nil 时用 tail=0 只跟踪新产生的日志。
+//
+// 注意 tail=0 的真实语义是"0 行历史"，不是"不限制"——它和 since 同用时
+// 会把 since 想要的历史全部吞掉（Engine 对历史先按 tail 截断、再按 since
+// 过滤）。因此带 since 的请求绝不能再带 tail。
 func (c *Client) LogsFollow(ctx context.Context, container string, since *time.Time) (StreamHandle, error) {
 	q := url.Values{}
 	q.Set("stdout", "1")
@@ -240,9 +248,21 @@ func (c *Client) LogsFollow(ctx context.Context, container string, since *time.T
 	if since != nil {
 		q.Set("since", strconv.FormatInt(since.Unix(), 10))
 	}
-	q.Set("tail", "0")
+	// tail=0 只在"不要历史"的场景使用；带 since 时省略 tail，见 tailParam。
+	if tail := tailParam(since); tail != "" {
+		q.Set("tail", tail)
+	}
 	path := "/containers/" + url.PathEscape(container) + "/logs?" + q.Encode()
 	c.log.Debug("跟踪容器日志: %s", path)
+
+	// TTY 容器（docker run -t / compose tty: true）的日志流没有 8 字节帧头，
+	// 是原始字节流；按帧解析会把日志文本当成帧长，一行都解不出来。
+	tty, terr := c.inspectTTY(ctx, container)
+	if terr != nil {
+		// 探测失败时按非 TTY 继续尝试：容器多半已经不存在，
+		// 后面的流请求会给出更准确的错误。
+		c.log.Debug("探测容器 %s 的 TTY 属性失败，按非 TTY 处理: %v", container, terr)
+	}
 
 	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
@@ -264,9 +284,45 @@ func (c *Client) LogsFollow(ctx context.Context, container string, since *time.T
 		lines:  make(chan string, 256),
 		body:   resp.Body,
 		cancel: ctx,
+		tty:    tty,
 	}
 	go stream.pump()
 	return stream, nil
+}
+
+// tailParam 返回日志请求应使用的 tail 参数。
+//
+// tail=0 在 Engine 里的含义是"0 行历史"（而非"不限量"）：它与 since 同用
+// 时，历史先被 tail 截成 0 行，since 形同虚设。带 since 的请求因此必须
+// 省略 tail；只有"不关心历史、只要新日志"的场景才传 tail=0。
+func tailParam(since *time.Time) string {
+	if since != nil {
+		return ""
+	}
+	return "0"
+}
+
+// inspectTTY 查询容器是否以 TTY 模式分配了伪终端（docker run -t）。
+func (c *Client) inspectTTY(ctx context.Context, container string) (bool, error) {
+	body, status, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(container)+"/json", nil)
+	if err != nil {
+		return false, err
+	}
+	if status == http.StatusNotFound {
+		return false, fmt.Errorf("容器 %s 不存在", container)
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("查询容器 %s 状态失败: HTTP %d %s", container, status, truncate(body))
+	}
+	var info struct {
+		Config struct {
+			Tty bool `json:"Tty"`
+		} `json:"Config"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return false, fmt.Errorf("解析容器 %s 配置失败: %w", container, err)
+	}
+	return info.Config.Tty, nil
 }
 
 // LogsRange 一次性读取容器自 since 起至今的日志行，不跟随。
@@ -282,9 +338,16 @@ func (c *Client) LogsRange(ctx context.Context, container string, since time.Tim
 	q.Set("stdout", "1")
 	q.Set("stderr", "1")
 	q.Set("follow", "0")
+	// 不能带 tail：tail=0 的语义是"0 行历史"，会把 since 想要的日志全部
+	// 吞掉，让回查永远返回空。省略 tail 即"不限制"。
 	q.Set("since", strconv.FormatInt(since.Unix(), 10))
-	q.Set("tail", "0")
 	path := "/containers/" + url.PathEscape(container) + "/logs?" + q.Encode()
+
+	// TTY 容器的日志流没有帧头，按原始行读取，见 LogsFollow 的说明。
+	tty, terr := c.inspectTTY(ctx, container)
+	if terr != nil {
+		c.log.Debug("探测容器 %s 的 TTY 属性失败，按非 TTY 处理: %v", container, terr)
+	}
 
 	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
@@ -305,6 +368,21 @@ func (c *Client) LogsRange(ctx context.Context, container string, since time.Tim
 	// 此时截断是合理代价。bufio 包在 LimitReader 外面，保证不越过上限。
 	reader := bufio.NewReaderSize(io.LimitReader(resp.Body, 8<<20), 64*1024)
 	var lines []string
+	if tty {
+		for {
+			line, rerr := reader.ReadString('\n')
+			if line = strings.TrimRight(line, "\r\n"); line != "" {
+				lines = append(lines, line)
+			}
+			if rerr != nil {
+				if errors.Is(rerr, io.EOF) {
+					break
+				}
+				return lines, fmt.Errorf("读取容器 %s 日志失败: %w", container, rerr)
+			}
+		}
+		return lines, nil
+	}
 	for {
 		frame, err := readLogFrame(reader)
 		if err != nil {
@@ -413,6 +491,9 @@ type httpStream struct {
 	cancel context.Context
 	once   sync.Once
 	err    error
+	// tty 表示容器以 TTY 模式运行：日志流是原始字节流（无 8 字节帧头），
+	// 按行读取而不是按帧解复用。
+	tty bool
 }
 
 func (s *httpStream) pump() {
@@ -420,6 +501,37 @@ func (s *httpStream) pump() {
 	defer s.body.Close()
 
 	reader := bufio.NewReaderSize(s.body, 64*1024)
+	if s.tty {
+		s.pumpRaw(reader)
+		return
+	}
+	s.pumpFrames(reader)
+}
+
+// pumpRaw 处理 TTY 容器的原始日志流：没有帧头，直接按行拆分。
+// 行尾的 \r\n 一并剥掉，交互式应用（PTY）常带 \r 回车。
+func (s *httpStream) pumpRaw(reader *bufio.Reader) {
+	for {
+		select {
+		case <-s.cancel.Done():
+			return
+		default:
+		}
+		line, err := reader.ReadString('\n')
+		if line = strings.TrimRight(line, "\r\n"); line != "" {
+			s.deliver(line)
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.once.Do(func() { s.err = err })
+			}
+			return
+		}
+	}
+}
+
+// pumpFrames 处理非 TTY 容器的多路复用日志流。
+func (s *httpStream) pumpFrames(reader *bufio.Reader) {
 	for {
 		select {
 		case <-s.cancel.Done():
@@ -439,12 +551,18 @@ func (s *httpStream) pump() {
 
 		// 一帧可能包含多行，逐行投递。
 		for _, line := range strings.Split(strings.TrimRight(string(frame), "\n"), "\n") {
-			select {
-			case s.lines <- line:
-			case <-s.cancel.Done():
-				return
-			}
+			s.deliver(line)
 		}
+	}
+}
+
+func (s *httpStream) deliver(line string) {
+	if line == "" {
+		return
+	}
+	select {
+	case s.lines <- line:
+	case <-s.cancel.Done():
 	}
 }
 

@@ -84,7 +84,8 @@ cleanup() {
   # 一并清理 7.5 节新增的临时容器，否则中途退出会留下占用固定端口的残留实例，
   # 下一次运行就会因为端口冲突而失败。
   docker rm -f "$SVC" "$TARGET" \
-    "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" "${WATCH2:-}" >/dev/null 2>&1
+    "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" "${WATCH2:-}" \
+    "${REPLAY_SVC:-}" "${REPLAY_PLAIN:-}" "${REPLAY_TTY:-}" >/dev/null 2>&1
   # 只删本次测试的临时目录，前缀严格匹配避免误伤。
   case "$WORK" in
     /tmp/${PREFIX}.*) rm -rf "$WORK" ;;
@@ -1109,6 +1110,95 @@ else:
 fi
 
 docker rm -f "$ADOPT_SVC" "$WATCH2" >/dev/null 2>&1
+
+# ---------- 7.6 启动即打出关键词的容器（历史回放 + TTY） ----------
+#
+# 曾经的核心缺陷：LogsFollow 请求带了 tail=0，而 Engine 的 tail=0 语义是
+# "0 行历史"（不是"不限制"）——历史先被 tail 截成 0 行、再按 since 过滤，
+# "回放启动以来的日志"完全失效。应用一启动就打印"等待直播"（发生在
+# 日志流建立之前），实时监控永远等不到它再次出现，容器就一直挂着。
+# TTY 容器（docker run -t）更糟：日志流没有 8 字节帧头，按帧解析
+# 连一行都解不出来。
+#
+# 本节先让目标容器跑起来并打出关键词，**然后**才启动服务——精确复现
+# "日志先于监控"的时序。回放路径（非 TTY）与原始行路径（TTY）任一
+# 不通过，这两个用例就必然失败。
+section "7.6 启动即打出关键词的容器（历史回放与 TTY）"
+
+REPLAY_PREFIX="${PREFIX}-replay"
+REPLAY_CFG="$WORK/replay/config"
+mkdir -p "$REPLAY_CFG"
+chmod 777 "$REPLAY_CFG"
+
+REPLAY_PLAIN="${REPLAY_PREFIX}-plain"
+REPLAY_TTY="${REPLAY_PREFIX}-tty"
+REPLAY_SVC="${REPLAY_PREFIX}-svc"
+docker rm -f "$REPLAY_PLAIN" "$REPLAY_TTY" "$REPLAY_SVC" >/dev/null 2>&1
+
+# 两个目标容器：打印关键词后挂住。非 TTY 与 TTY（-t）各一个。
+docker run -d --name "$REPLAY_PLAIN" alpine:3.22 sh -c \
+  'echo "等待直播"; sleep 600' >/dev/null 2>&1
+docker run -d -t --name "$REPLAY_TTY" alpine:3.22 sh -c \
+  'echo "等待直播"; sleep 600' >/dev/null 2>&1
+
+# start_times 设在深夜：今天绝不触发，接管完全由"启动接管"逻辑完成，
+# 与调度补跑无关——时序干净，失败好定位。
+cat > "$REPLAY_CFG/config.json" << EOF
+{
+  "watch_dir": "$WORK/replay/audio",
+  "mp3_bitrate": "32k",
+  "check_interval": 3600,
+  "monitor_keywords": "等待直播",
+  "containers": [
+    {"name": "$REPLAY_PLAIN", "start_times": "23:59", "max_run_duration": 3600, "keywords": "等待直播"},
+    {"name": "$REPLAY_TTY", "start_times": "23:59", "max_run_duration": 3600, "keywords": "等待直播"}
+  ]
+}
+EOF
+mkdir -p "$WORK/replay/audio"
+
+docker run -d --name "$REPLAY_SVC" \
+  -v "$REPLAY_CFG:/config" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e LIVEMONITOR_CONFIG=/config/config.json \
+  "$IMAGE" >/dev/null 2>&1
+
+# 接管 + 回放命中 + docker stop 收敛，全程应在数十秒内完成。
+replay_deadline=45
+for _ in $(seq 1 "$replay_deadline"); do
+  plain_state=$(docker inspect -f '{{.State.Running}}' "$REPLAY_PLAIN" 2>/dev/null || echo missing)
+  tty_state=$(docker inspect -f '{{.State.Running}}' "$REPLAY_TTY" 2>/dev/null || echo missing)
+  if [ "$plain_state" != "true" ] && [ "$tty_state" != "true" ]; then
+    break
+  fi
+  sleep 1
+done
+
+REPLAY_LOG=$(docker logs "$REPLAY_SVC" 2>&1)
+
+if [ "$plain_state" != "true" ]; then
+  c_ok "非 TTY 容器：启动前打印的关键词被回放命中并停止"
+else
+  c_bad "非 TTY 容器未被停止（历史回放失效？）"
+fi
+
+if [ "$tty_state" != "true" ]; then
+  c_ok "TTY 容器：启动前打印的关键词被按原始行解析命中并停止"
+else
+  c_bad "TTY 容器未被停止（原始行解析失效？）"
+fi
+
+# 命中必须来自日志监控路径，而非超时/其他兜底。
+hits=$(printf '%s' "$REPLAY_LOG" | grep -c "检测到关键词: 等待直播" || true)
+hits="${hits:-0}"
+if [ "$hits" -ge 2 ]; then
+  c_ok "两个容器均走日志关键词路径命中（共 $hits 次）"
+else
+  c_bad "关键词命中次数不足（$hits 次，期望 ≥2）"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$REPLAY_LOG" | grep -E "replay|检测到|停止" | tail -8 | sed 's/^/            /')"
+fi
+
+docker rm -f "$REPLAY_SVC" "$REPLAY_PLAIN" "$REPLAY_TTY" >/dev/null 2>&1
 
 # ---------- 8. 优雅退出 ----------
 
