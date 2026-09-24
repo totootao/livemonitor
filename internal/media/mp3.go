@@ -71,6 +71,10 @@ func ProbeMP3(path string) (MP3Info, error) {
 	var window []byte
 	total := int64(0)
 
+	// vbrHint 记录遇到过的 Xing/Info 信息帧。若整段扫描里只找到信息帧、
+	// 没找到独立音频帧，就退回用它解析出的参数。
+	var vbrHint *MP3Info
+
 	for total < maxScan {
 		n, readErr := f.Read(buf)
 		if n > 0 {
@@ -85,6 +89,20 @@ func ProbeMP3(path string) (MP3Info, error) {
 			if !ok {
 				continue
 			}
+			flen := frameLength(info)
+
+			// Xing/Info 信息帧不是音频数据，且其码率字段通常与实际音频不符
+			// （典型情况：LAME 写 32k CBR 文件时，信息帧头里填的是 56k）。
+			// 必须跳过它继续往后找真正的音频帧，否则低码率文件会被误判为高码率，
+			// 进而在每轮扫描里被重压一遍——音质白白掉一次，纯属浪费。
+			if flen > 0 && i+flen <= len(window) && HasXingHeader(window[i:i+flen], info) {
+				marked := info
+				marked.VBR = true
+				vbrHint = &marked
+				i += flen - 1 // -1 抵消循环自增
+				continue
+			}
+
 			// 二次校验：确认后面不远处确实还有一帧，避免误命中 ID3 正文
 			// 或音频数据里偶然出现的伪同步字。
 			//
@@ -92,10 +110,7 @@ func ProbeMP3(path string) (MP3Info, error) {
 			// 常见情况——VBR 文件（帧长浮动），以及 Shine 这类"按内容实际长度
 			// 写帧、不补齐到帧长"的编码器。因此在理论位置附近开一个窗口搜索，
 			// 只要能在窗口内找到下一帧就认可。
-			if info.VBR {
-				return info, nil
-			}
-			next := i + frameLength(info)
+			next := i + flen
 			if hasFrameHeaderNear(window, next) {
 				return info, nil
 			}
@@ -111,6 +126,11 @@ func ProbeMP3(path string) (MP3Info, error) {
 		if readErr != nil {
 			break
 		}
+	}
+	// 只遇到信息帧没遇到音频帧：那是 VBR 文件的标志，退回信息帧的参数
+	// （采样率与声道可靠，码率仅作参考）。
+	if vbrHint != nil {
+		return *vbrHint, nil
 	}
 	return MP3Info{}, ErrNoMP3Frame
 }
@@ -262,17 +282,51 @@ func parseFrameHeader(b []byte) (MP3Info, bool) {
 	}, true
 }
 
-// HasXingHeader 检测帧内是否含 Xing/Info/VBRI 头（表示 VBR）。
-func HasXingHeader(frame []byte) bool {
-	if len(frame) < 40 {
+// sideInfoLen 返回该帧配置下 side info 的字节长度。
+//
+// 这个长度决定了 Xing/Info 标签在帧内的偏移，必须按版本与声道区分：
+//
+//	MPEG-1 立体声 32    MPEG-1 单声道 17
+//	MPEG-2 立体声 17    MPEG-2 单声道 9
+func sideInfoLen(info MP3Info) int {
+	mpeg1 := info.Version == "MPEG-1"
+	stereo := info.Channels == 2
+	switch {
+	case mpeg1 && stereo:
+		return 32
+	case mpeg1 && !stereo:
+		return 17
+	case !mpeg1 && stereo:
+		return 17
+	default:
+		return 9
+	}
+}
+
+// HasXingHeader 检测帧内是否含 Xing/Info/VBRI 头。
+//
+// Xing/Info 是编码器写入的"元数据帧"：它自己占一整个 MPEG 帧的位置，
+// 但**不是音频数据**，而且它的码率字段常常与实际音频码率不一致
+// （LAME 写 32k 的 CBR 文件时，信息帧头里填的是 56k）。
+// 因此解析码率时必须跳过它，否则会把 32k 的文件误判成 56k。
+//
+// 标签位置 = 4 字节帧头 + side info 长度。VBRI 固定在帧头后 4+32 处，
+// 与声道无关（Fraunhofer 编码器的约定）。
+func HasXingHeader(frame []byte, info MP3Info) bool {
+	// VBRI：Fraunhofer 固定偏移。
+	if len(frame) >= 36 && matchesTag(frame[32:36], "VBRI") {
+		return true
+	}
+	off := 4 + sideInfoLen(info)
+	if len(frame) < off+4 {
 		return false
 	}
-	for _, tag := range []string{"Xing", "Info", "VBRI"} {
-		if binary.BigEndian.Uint32(frame[36:40]) == binary.BigEndian.Uint32([]byte(tag)) {
-			return true
-		}
-	}
-	return false
+	return matchesTag(frame[off:off+4], "Xing") || matchesTag(frame[off:off+4], "Info")
+}
+
+// matchesTag 比较 4 字节是否等于给定 ASCII 标签。
+func matchesTag(b []byte, tag string) bool {
+	return len(b) >= 4 && binary.BigEndian.Uint32(b) == binary.BigEndian.Uint32([]byte(tag))
 }
 
 // Describe 返回可读的音频描述。

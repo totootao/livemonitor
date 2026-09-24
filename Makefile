@@ -7,7 +7,7 @@ IMAGE_TAG  ?= $(VERSION)
 PKG        := github.com/totootao/livemonitor/internal/cli
 LDFLAGS    := -s -w -X $(PKG).Version=$(VERSION)
 
-.PHONY: all build test test-race vet fmt lint clean run init check web docker docker-run compose-up compose-down help
+.PHONY: all build test test-race vet fmt lint clean run init check web docker docker-run compose-up compose-down e2e help
 all: fmt vet test build
 
 ## build: 编译单文件二进制到 bin/
@@ -23,6 +23,10 @@ test:
 ## test-race: 开启竞态检测运行测试
 test-race:
 	go test -race ./... -count=1
+
+## e2e: 容器级端到端测试（先构建镜像，再跑全流程校验）
+e2e:
+	IMAGE=$(IMAGE):e2e BUILD=1 bash scripts/e2e.sh
 
 ## vet: 静态检查
 vet:

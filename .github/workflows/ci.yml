@@ -54,3 +54,41 @@ jobs:
             cat /tmp/verify-embed.log
           fi
           exit "$status"
+
+  e2e:
+    name: 容器级端到端测试
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 单元测试全绿不代表镜像能用：缺文件、entrypoint 参数传错、
+      # 时区数据丢失这类问题只在真实容器里暴露。这一组用例负责那部分。
+      #
+      # 曾经真实抓到过的问题：LAME 写入的 Xing/Info 信息帧头里码率字段
+      # 与实际音频不符（32k 的文件里写着 56k），导致低码率文件每轮扫描
+      # 都被重压一遍。纯逻辑测试造不出这种素材，只有真实编码器产出的文件才行。
+      - name: 构建镜像
+        run: docker build -t livemonitor:ci .
+
+      # ffmpeg 仅用于生成测试素材（不同码率、带/不带 Xing 头），
+      # 被测镜像自身并不包含 ffmpeg —— 这一点由脚本的第 1 组用例断言。
+      - name: 安装 ffmpeg（生成测试素材用）
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: 运行端到端测试
+        env:
+          IMAGE: livemonitor:ci
+          PREFIX: lmci
+        run: bash scripts/e2e.sh
+
+      - name: 失败时导出服务日志
+        if: failure()
+        run: |
+          echo "----- 容器列表 -----"
+          docker ps -a || true
+          for c in lmci-svc lmci-target; do
+            echo "----- $c 日志 -----"
+            docker logs "$c" 2>&1 | tail -60 || true
+          done

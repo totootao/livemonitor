@@ -179,21 +179,45 @@ docker CLI**，因此体积比走命令行的方案小约 31MB。
 
 ## 测试
 
+测试分两层：**单元测试**验证逻辑，**端到端测试**验证"打出来的镜像能不能用"。
+
+### 单元测试
+
 ```bash
 make test              # 全部单元测试
-make test-race         # 竞态检测
+make test-race         # 竞态检测（CI 用这个）
 ```
 
-测试不依赖网络：
+不依赖网络，也不需要 ffmpeg——测试素材由 `go-mp3` / `shine-mp3` 现场合成：
 
 - `internal/dockerctl` 用临时 unix socket 起一个假的 Engine API 服务，覆盖探活、启停、
   日志帧解析与请求路径转义；
 - `internal/monitor` 使用假的客户端与可控日志流驱动关键词匹配；
-- `internal/media` 用纯 Go 合成测试素材，覆盖帧头解析、解码、重采样、重编码与转码产物校验；
+- `internal/media` 覆盖帧头解析（含 Xing/Info 信息帧跳过）、解码、重采样、重编码与产物校验；
 - `internal/runtime` 验证配置热更新的原子落盘与并发安全；
 - `internal/web` 通过假控制器覆盖全部 HTTP 接口（含错误路径与路径穿越防护）。
 
-想对真实 Docker 跑一遍集成测试（需要本机可用的 docker socket）：
+### 端到端测试
+
+```bash
+make e2e               # 构建镜像后跑全流程（需要本机 docker）
+IMAGE=tototao/livemonitor:latest bash scripts/e2e.sh   # 直接测已有镜像
+```
+
+49 项断言，覆盖 8 个方面：
+
+| 分组 | 验证内容 |
+| --- | --- |
+| 镜像内容 | 确认 `ffmpeg` / `docker` CLI **确实不存在**，时区数据可用，entrypoint 可执行 |
+| 素材准备 | 用 ffmpeg 造多种码率、带/不带 Xing 头的测试文件 |
+| CLI 子命令 | `init` / `check` 的行为与错误提示（含重复 init 拒绝覆盖） |
+| 压缩主流程 | 日志关键节点、不支持格式告警**且去重**（周期性扫描不应刷屏） |
+| 产物校验 | 码率/采样率/声道/时长/压缩比，并验证低码率文件**被跳过** |
+| Web 界面 | 首页、`/api/state`、改设置写回磁盘、非法输入返回 400 |
+| 容器控制 | 真实 Engine API 启停容器 |
+| 优雅退出 | SIGTERM 后正常退出并打印停止流程 |
+
+想单独对真实 Docker 测 Engine API 客户端：
 
 ```bash
 docker run -d --name livemonitor-selftest alpine:3.22 \
@@ -201,6 +225,10 @@ docker run -d --name livemonitor-selftest alpine:3.22 \
 LIVEMONITOR_DOCKER_E2E=1 go test -run TestLive -v ./internal/dockerctl/
 docker rm -f livemonitor-selftest
 ```
+
+> 端到端测试不是摆设。它实际抓到过一个只有真实容器才暴露的 bug：
+> LAME 写入的 Xing/Info 信息帧头里码率字段与实际音频不符（32k 的文件里写着 56k），
+> 导致低码率文件每轮扫描都被重压一遍。纯逻辑测试造不出这种素材。
 
 ## 项目结构
 
@@ -212,8 +240,10 @@ internal/logging/         带作用域前缀的并发安全日志
 internal/dockerctl/       Docker Engine API 客户端（unix socket + HTTP，无 CLI 依赖）
 internal/scheduler/       每日定点调度（支持按 ID 精确增删）
 internal/monitor/         容器生命周期监控
-internal/media/           MP3 帧头解析、纯 Go 重编码、目录扫描与归档
+internal/media/           MP3 帧头解析（跳过 Xing/Info 信息帧）、纯 Go 重编码、目录扫描与归档
 internal/runtime/         可热更新的并发安全配置存储（原子落盘）
 internal/web/             Web 管理界面与 JSON API（go:embed 内嵌页面）
 internal/manager/         编排各组件、Web 服务与信号处理
+scripts/verify-embed.sh   校验二进制内嵌了 Web 页面（CI 用）
+scripts/e2e.sh            容器级端到端测试（49 项断言）
 ```
