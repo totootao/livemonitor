@@ -85,7 +85,8 @@ cleanup() {
   # 下一次运行就会因为端口冲突而失败。
   docker rm -f "$SVC" "$TARGET" \
     "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" "${WATCH2:-}" \
-    "${REPLAY_SVC:-}" "${REPLAY_PLAIN:-}" "${REPLAY_TTY:-}" >/dev/null 2>&1
+    "${REPLAY_SVC:-}" "${REPLAY_PLAIN:-}" "${REPLAY_TTY:-}" \
+    "${CLR_SVC:-}" "${CLR_TARGET:-}" >/dev/null 2>&1
   # 只删本次测试的临时目录，前缀严格匹配避免误伤。
   case "$WORK" in
     /tmp/${PREFIX}.*) rm -rf "$WORK" ;;
@@ -1009,6 +1010,15 @@ else
     c_bad "前置失败：程序未启动/接管目标容器，无法验证外部停止（start 返回 HTTP $START_CODE）"
     printf '      \033[2m日志: %s\033[0m\n' "$(docker logs "$ADOPT_SVC" 2>&1 | tail -8 | sed 's/^/            /')"
   else
+    # 启动前日志清理是"尽力而为"：本节的服务实例没有挂载宿主机的
+    # /var/lib/docker/containers，json 日志文件不可达，应优雅跳过并说明，
+    # 而不是报错阻塞启动。
+    if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "跳过启动前日志清理"; then
+      c_ok "未挂载日志目录时启动前清理被优雅跳过"
+    else
+      c_bad "未挂载日志目录时未出现清理跳过说明"
+    fi
+
     # ---- 核心回归三：热重载不得重放任务，也不得误停正在运行的容器 ----
     #
     # 必须放在"外部停止"之前：一旦容器被外部停掉，它本来就该是未运行状态，
@@ -1199,6 +1209,120 @@ else
 fi
 
 docker rm -f "$REPLAY_SVC" "$REPLAY_PLAIN" "$REPLAY_TTY" >/dev/null 2>&1
+
+# ---------- 7.7 启动前清理历史日志 ----------
+#
+# 程序在 docker start 之前先截断该容器的 json 日志文件：
+#   1) 上一轮的关键词不会残留到本轮的回放与回查里；
+#   2) 日志文件不随反复重启无限膨胀。
+#
+# 清理直接截断 inspect 返回的宿主机 LogPath，因此服务实例必须**读写挂载**
+# /var/lib/docker/containers 才能真正生效（本节挂载它做真实验证）；
+# 未挂载时优雅跳过的行为已在 7.5 节断言。截断安全性依赖两点，
+# 改动前务必确认仍然成立：
+#   - 只在容器停止时清理（运行中的容器在 dockerctl 层被直接拒绝）；
+#   - json-file 驱动以 O_APPEND 写入，截断后新日志从文件头继续，无稀疏空洞。
+section "7.7 启动前清理历史日志"
+
+CLR_PREFIX="${PREFIX}-clr"
+CLR_CFG="$WORK/clearlog/config"
+CLR_PORT=18993
+mkdir -p "$CLR_CFG"
+chmod 777 "$CLR_CFG"
+
+CLR_TARGET="${CLR_PREFIX}-target"
+CLR_SVC="${CLR_PREFIX}-svc"
+CLR_FLAG="$WORK/clearlog/flag"
+mkdir -p "$CLR_FLAG"
+docker rm -f "$CLR_TARGET" "$CLR_SVC" >/dev/null 2>&1
+
+# 上一轮：跑起来、留下标记日志、再停掉——模拟"重启前后日志文件不清理"的历史现场。
+# 两轮跑的是**同一个容器实例、同一条命令**，靠挂载的 flag 文件区分轮次：
+# 首轮打 OLD-ROUND-MARK 并创建标记文件，再次启动时打 NEW-ROUND-MARK。
+# 若不做区分，第二轮容器自己也会打出 OLD-ROUND-MARK，"残留是否被清"就无从判断。
+docker run -d --name "$CLR_TARGET" \
+  -v "$CLR_FLAG:/flag" \
+  alpine:3.22 sh -c \
+  'if [ -f /flag/first ]; then echo "NEW-ROUND-MARK"; else echo "OLD-ROUND-MARK"; touch /flag/first; fi; sleep 600' >/dev/null 2>&1
+sleep 2
+docker stop "$CLR_TARGET" >/dev/null 2>&1
+if contains "$(docker logs "$CLR_TARGET" 2>&1)" "OLD-ROUND-MARK"; then
+  c_ok "前置：上一轮标记日志确实存在"
+else
+  c_bad "前置失败：上一轮标记日志不存在，本节断言失效"
+fi
+
+cat > "$CLR_CFG/config.json" << EOF
+{
+  "watch_dir": "$WORK/clearlog/audio",
+  "mp3_bitrate": "32k",
+  "check_interval": 3600,
+  "monitor_keywords": "等待直播",
+  "containers": [{
+    "name": "$CLR_TARGET",
+    "start_times": "23:59",
+    "max_run_duration": 3600,
+    "keywords": "等待直播"
+  }]
+}
+EOF
+mkdir -p "$WORK/clearlog/audio"
+
+# 服务实例读写挂载宿主机日志目录，让"启动前清理"真正生效。
+docker run -d --name "$CLR_SVC" \
+  -v "$CLR_CFG:/config" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /var/lib/docker/containers:/var/lib/docker/containers \
+  -p "127.0.0.1:${CLR_PORT}:8080" \
+  -e LIVEMONITOR_CONFIG=/config/config.json \
+  "$IMAGE" >/dev/null 2>&1
+sleep 3
+
+START_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:${CLR_PORT}/api/containers/$CLR_TARGET/start" 2>/dev/null)
+
+clr_up=0
+for _ in $(seq 1 30); do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$CLR_TARGET" 2>/dev/null || echo false)" = "true" ] \
+     && contains "$(docker logs "$CLR_SVC" 2>&1)" "已清空容器历史日志"; then
+    clr_up=1; break
+  fi
+  sleep 1
+done
+
+if [ "$START_CODE" != "200" ]; then
+  c_bad "前置失败：start 返回 HTTP $START_CODE，无法验证启动前清理"
+elif [ "$clr_up" != "1" ]; then
+  c_bad "启动后未见\"已清空容器历史日志\""
+  printf '      \033[2m日志: %s\033[0m\n' "$(docker logs "$CLR_SVC" 2>&1 | grep -E "清理|清空|跳过" | tail -5 | sed 's/^/            /')"
+else
+  c_ok "启动前已清空容器历史日志（挂载场景真实生效）"
+fi
+
+# 核心断言：旧一轮的 OLD-ROUND-MARK 必须随清理消失；本轮的 NEW-ROUND-MARK
+# 必须正常出现——同时验证截断后的写入没有稀疏空洞、不错乱。
+clr_ok=0
+for _ in $(seq 1 10); do
+  CLR_LOG=$(docker logs "$CLR_TARGET" 2>&1)
+  if contains "$CLR_LOG" "NEW-ROUND-MARK"; then
+    clr_ok=1; break
+  fi
+  sleep 1
+done
+CLR_LOG=$(docker logs "$CLR_TARGET" 2>&1)
+if contains "$CLR_LOG" "OLD-ROUND-MARK"; then
+  c_bad "历史日志未被清空（OLD-ROUND-MARK 仍在）"
+else
+  c_ok "上一轮残留日志已随清理消失"
+fi
+if [ "$clr_ok" = "1" ]; then
+  c_ok "本轮日志正常写入（截断未破坏 O_APPEND 追加写入）"
+else
+  c_bad "未见本轮日志 NEW-ROUND-MARK，截断可能破坏了写入"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$CLR_LOG" | head -5 | sed 's/^/            /')"
+fi
+
+docker rm -f "$CLR_SVC" "$CLR_TARGET" >/dev/null 2>&1
 
 # ---------- 8. 优雅退出 ----------
 

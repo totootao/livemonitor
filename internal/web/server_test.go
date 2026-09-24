@@ -295,6 +295,7 @@ func (noopRunner) Start(ctx context.Context, container string) error            
 func (noopRunner) Stop(ctx context.Context, container string) error                 { return nil }
 func (noopRunner) TruncateInternalLogs(ctx context.Context, container string) error { return nil }
 func (noopRunner) RotateLogs(ctx context.Context, container string) error           { return nil }
+func (noopRunner) ClearLogs(ctx context.Context, container string) error            { return nil }
 func (noopRunner) LogsFollow(ctx context.Context, container string, since *time.Time) (dockerctl.StreamHandle, error) {
 	return nil, fmt.Errorf("未实现")
 }

@@ -37,6 +37,7 @@ type fakeRunner struct {
 	stopped   int
 	truncated int
 	rotated   int
+	cleared   int
 	// running 是未设置 inspectFn/inspectStateFn 时的默认容器状态。
 	// 默认 false 表示容器不存在；之所以不选择"调 Start 就变 true"，
 	// 是为了让 Start 内部的 InspectState 与随后的 Start 两个调用语义清晰分离。
@@ -47,6 +48,8 @@ type fakeRunner struct {
 	streams        []*fakeStream
 	startErr       error
 	stopErr        error
+	// clearLogsErr 让启动前的日志清理失败，验证不阻塞启动。
+	clearLogsErr error
 	// followErr 让 LogsFollow 直接失败，用于构造"实时监控不可用"的场景。
 	followErr error
 	// logsRangeFn 定制回查结果；nil 时返回空日志。
@@ -55,6 +58,8 @@ type fakeRunner struct {
 
 	logsRangeCalls  int
 	logsRangeSinces []time.Time
+	// ops 记录 docker 操作的发生顺序，供"清日志必须在 start 之前"这类时序断言。
+	ops []string
 }
 
 func newFakeRunner() *fakeRunner { return &fakeRunner{} }
@@ -74,11 +79,35 @@ func (f *fakeRunner) InspectState(ctx context.Context, container string) (docker
 func (f *fakeRunner) Start(ctx context.Context, container string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.ops = append(f.ops, "start")
 	if f.startErr != nil {
 		return f.startErr
 	}
 	f.started++
 	return nil
+}
+
+// ClearLogs 模拟启动前的日志清理，并记录调用以供时序断言。
+func (f *fakeRunner) ClearLogs(ctx context.Context, container string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ops = append(f.ops, "clear")
+	f.cleared++
+	return f.clearLogsErr
+}
+
+// opOrder 返回记录到的操作顺序快照。
+func (f *fakeRunner) opOrder() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.ops...)
+}
+
+// clearCount 返回启动前清理被调用的次数。
+func (f *fakeRunner) clearCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.cleared
 }
 
 func (f *fakeRunner) Stop(ctx context.Context, container string) error {
@@ -188,6 +217,67 @@ func newTestMonitor(t *testing.T, fn *fakeRunner, keywords []string, maxDur time
 	m.sweepDelay = 50 * time.Millisecond
 	m.sweepTimeout = 500 * time.Millisecond
 	return m
+}
+
+// TestStartClearsLogsBeforeStarting 启动前必须先清空历史日志，
+// 且清空必须发生在 docker start **之前**——否则上一轮残留的关键词
+// 可能混进本轮的回放/回查窗口。
+func TestStartClearsLogsBeforeStarting(t *testing.T) {
+	fn := newFakeRunner()
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+
+	m.Start()
+	m.waitRunning(t)
+
+	if got := fn.clearCount(); got != 1 {
+		t.Errorf("启动前清理调用次数 = %d, 期望 1", got)
+	}
+	ops := fn.opOrder()
+	if len(ops) != 2 || ops[0] != "clear" || ops[1] != "start" {
+		t.Errorf("操作顺序应为 [clear start]，实际 %v", ops)
+	}
+	m.Stop(ReasonShutdown)
+}
+
+// TestAdoptDoesNotClearLogs 接管已在运行的容器时绝不能清日志——
+// 那些日志正在被监控，清掉等于销毁正在分析的数据。
+func TestAdoptDoesNotClearLogs(t *testing.T) {
+	fn := newFakeRunner()
+	fn.inspectStateFn = func() (dockerctl.ContainerState, error) {
+		return dockerctl.ContainerState{Running: true, StartedAt: time.Now().Add(-time.Minute)}, nil
+	}
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+
+	m.Start()
+	m.waitRunning(t)
+
+	if got := fn.clearCount(); got != 0 {
+		t.Errorf("接管路径不应触发日志清理，实际调用 %d 次", got)
+	}
+	if _, stopped, _, _ := fn.counts(); stopped != 0 {
+		t.Error("接管路径不应启动或停止容器")
+	}
+	m.Stop(ReasonShutdown)
+}
+
+// TestStartContinuesWhenClearFails 日志清不掉（未挂载宿主机日志目录等）
+// 不能阻塞启动——监控语义仍以本轮启动时刻为界。
+func TestStartContinuesWhenClearFails(t *testing.T) {
+	fn := newFakeRunner()
+	fn.clearLogsErr = errors.New("日志文件不可达")
+	m := newTestMonitor(t, fn, []string{"等待直播"}, time.Hour)
+
+	m.Start()
+	m.waitRunning(t)
+
+	started, _, _, _ := fn.counts()
+	if started != 1 {
+		t.Errorf("清理失败后仍应启动容器，start 次数 = %d", started)
+	}
+	if got := fn.clearCount(); got != 1 {
+		t.Errorf("清理应被尝试调用 1 次，实际 %d", got)
+	}
+	m.Stop(ReasonShutdown)
 }
 
 // TestStartIdempotent 重复 Start 只应实际启动一次。

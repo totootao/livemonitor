@@ -26,6 +26,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -226,6 +227,57 @@ func (c *Client) RotateLogs(ctx context.Context, container string) error {
 	}
 	if status != http.StatusOK {
 		return fmt.Errorf("读取容器 %s 日志失败: HTTP %d %s", container, status, truncate(body))
+	}
+	return nil
+}
+
+// ClearLogs 清空容器的 json 日志文件。供"启动前清理"使用：
+// 上一轮的关键词不会残留到本轮的回放与回查里，日志文件也不会随
+// 反复重启无限膨胀。
+//
+// Docker Engine 至今没有截断日志的 API，唯一可靠的途径是直接截断
+// 宿主机上的日志文件——inspect 返回的 LogPath 指向它（json-file 驱动）。
+// 两个安全前提：
+//   - 只在容器**停止**时清理：驱动以 O_APPEND 写入，停止状态没有并发写，
+//     截断后新日志从文件头继续，不会产生稀疏空洞；
+//   - 运行中的容器（可能在被监控）直接拒绝。
+//
+// 文件不可达时（livemonitor 容器未挂载宿主机的 /var/lib/docker/containers、
+// 日志驱动不是 json-file 等）返回错误，调用方按"尽力而为"降级——
+// 此时监控语义依然正确：回放以本轮启动时刻为界，上一轮日志不会被误读。
+func (c *Client) ClearLogs(ctx context.Context, container string) error {
+	body, status, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(container)+"/json", nil)
+	if err != nil {
+		return err
+	}
+	if status == http.StatusNotFound {
+		return fmt.Errorf("容器 %s 不存在", container)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("查询容器 %s 状态失败: HTTP %d %s", container, status, truncate(body))
+	}
+	var info struct {
+		State struct {
+			Running    bool `json:"Running"`
+			Restarting bool `json:"Restarting"`
+		} `json:"State"`
+		LogPath string `json:"LogPath"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return fmt.Errorf("解析容器 %s 配置失败: %w", container, err)
+	}
+	if info.State.Running || info.State.Restarting {
+		return fmt.Errorf("容器 %s 正在运行，拒绝清理其日志", container)
+	}
+	if info.LogPath == "" {
+		return fmt.Errorf("容器 %s 未返回日志文件路径（日志驱动可能不是 json-file）", container)
+	}
+	if _, err := os.Stat(info.LogPath); err != nil {
+		return fmt.Errorf("日志文件 %s 不可达（部署为容器时需读写挂载宿主机的 /var/lib/docker/containers）: %w",
+			info.LogPath, err)
+	}
+	if err := os.Truncate(info.LogPath, 0); err != nil {
+		return fmt.Errorf("截断日志文件 %s 失败: %w", info.LogPath, err)
 	}
 	return nil
 }

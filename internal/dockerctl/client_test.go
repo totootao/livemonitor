@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -679,6 +680,64 @@ func TestLogsRangeTTYRawStream(t *testing.T) {
 		if lines[i] != want[i] {
 			t.Errorf("第 %d 行应为 %q，实际 %q", i, want[i], lines[i])
 		}
+	}
+}
+
+// ---- ClearLogs（启动前清理） ----
+
+// 正常路径：容器停止、LogPath 可达 → 截断文件内容。
+func TestClearLogsTruncatesFile(t *testing.T) {
+	f := newFakeEngine(t)
+	logFile := filepath.Join(t.TempDir(), "container-json.log")
+	if err := os.WriteFile(logFile, []byte("上一轮的等待直播\n"), 0o644); err != nil {
+		t.Fatalf("写测试日志文件失败: %v", err)
+	}
+	f.json(http.MethodGet, "/containers/zhangsan/json", http.StatusOK, map[string]any{
+		"State":   map[string]any{"Running": false},
+		"LogPath": logFile,
+	})
+	if err := f.client().ClearLogs(context.Background(), "zhangsan"); err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	data, err := os.ReadFile(logFile)
+	if err != nil {
+		t.Fatalf("读取日志文件失败: %v", err)
+	}
+	if len(data) != 0 {
+		t.Errorf("日志文件应被清空，实际剩余 %d 字节", len(data))
+	}
+}
+
+// 运行中的容器必须拒绝清理：日志正被驱动写入，且可能正处于监控之下。
+func TestClearLogsRefusesRunning(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/zhangsan/json", http.StatusOK, map[string]any{
+		"State":   map[string]any{"Running": true},
+		"LogPath": "/var/lib/docker/containers/x/x-json.log",
+	})
+	err := f.client().ClearLogs(context.Background(), "zhangsan")
+	if err == nil {
+		t.Fatal("运行中的容器应拒绝清理")
+	}
+	if !strings.Contains(err.Error(), "拒绝") {
+		t.Errorf("错误信息应说明拒绝原因，实际: %v", err)
+	}
+}
+
+// 日志文件不可达（未挂载宿主机日志目录、驱动非 json-file）应返回明确错误，
+// 由调用方按"尽力而为"降级，而不是静默假装成功。
+func TestClearLogsUnreachablePath(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/zhangsan/json", http.StatusOK, map[string]any{
+		"State":   map[string]any{"Running": false},
+		"LogPath": filepath.Join(t.TempDir(), "not-exist.log"),
+	})
+	err := f.client().ClearLogs(context.Background(), "zhangsan")
+	if err == nil {
+		t.Fatal("路径不可达应报错")
+	}
+	if !strings.Contains(err.Error(), "不可达") {
+		t.Errorf("错误信息应说明文件不可达，实际: %v", err)
 	}
 }
 

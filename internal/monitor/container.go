@@ -20,6 +20,7 @@ type Runner interface {
 	Stop(ctx context.Context, container string) error
 	TruncateInternalLogs(ctx context.Context, container string) error
 	RotateLogs(ctx context.Context, container string) error
+	ClearLogs(ctx context.Context, container string) error
 	LogsFollow(ctx context.Context, container string, since *time.Time) (dockerctl.StreamHandle, error)
 	LogsRange(ctx context.Context, container string, since time.Time) ([]string, error)
 }
@@ -295,6 +296,22 @@ func (m *ContainerMonitor) Start() {
 	startedAt := time.Now()
 	m.log.Info("启动容器...")
 	m.log.Info("启动时间: %s", startedAt.Format("2006-01-02 15:04:05"))
+
+	// 启动前清空历史日志：
+	//   1) 上一轮的关键词不会残留到本轮的回放与回查里，杜绝"刚拉起就被
+	//      上一轮残留日志误杀"的可能；
+	//   2) 日志文件不随反复重启无限膨胀。
+	// 此时容器必然处于停止状态，截断 json 日志文件是安全的（驱动以
+	// O_APPEND 写入，没有并发写）。清不掉不阻塞启动——未挂载宿主机
+	// 日志目录、驱动不是 json-file 时按"尽力而为"降级，监控本来就以
+	// 本轮启动时刻为界，上一轮日志不会误读本轮。
+	clearCtx, clearCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := m.runner.ClearLogs(clearCtx, m.name); err == nil {
+		m.log.Info("已清空容器历史日志，本轮监控从干净状态开始")
+	} else {
+		m.log.Info("跳过启动前日志清理: %v", err)
+	}
+	clearCancel()
 
 	startCtx, startCancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer startCancel()
