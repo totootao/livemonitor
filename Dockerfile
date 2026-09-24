@@ -56,6 +56,11 @@ VOLUME ["/config"]
 
 ENV LIVEMONITOR_CONFIG=/config/config.json
 ENV LIVEMONITOR_LOG_LEVEL=info
+# Web 管理界面监听地址；设为 off 可禁用。
+ENV LIVEMONITOR_WEB_ADDR=:8080
+
+# Web 管理界面端口。需在 docker run -p / compose ports 中映射到宿主机。
+EXPOSE 8080
 
 # OCI 标准标签，便于在 Docker Hub / 各类注册表中展示来源信息。
 LABEL org.opencontainers.image.title="livemonitor" \

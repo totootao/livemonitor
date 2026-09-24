@@ -9,6 +9,7 @@ set -eu
 
 CONFIG_PATH="${LIVEMONITOR_CONFIG:-/config/config.json}"
 LOG_LEVEL="${LIVEMONITOR_LOG_LEVEL:-info}"
+WEB_ADDR="${LIVEMONITOR_WEB_ADDR:-:8080}"
 
 mkdir -p "$(dirname "$CONFIG_PATH")"
 
@@ -19,12 +20,19 @@ fi
 
 echo "[entrypoint] 使用配置: $CONFIG_PATH"
 echo "[entrypoint] 日志级别: $LOG_LEVEL"
+echo "[entrypoint] Web 管理界面: ${WEB_ADDR:-已禁用}"
 echo "[entrypoint] 本地时间: $(date '+%Y-%m-%d %H:%M:%S %Z')"
 
 # 检查 docker socket 是否可用，缺失时仅告警（媒体转码仍可工作）。
 if [ ! -S /var/run/docker.sock ]; then
     echo "[entrypoint] 警告: 未检测到 /var/run/docker.sock，容器控制功能将不可用"
 fi
+
+# 仅在 run 子命令上追加 -web，避免 init/check 等命令因未知 flag 报错。
+set -- "$@"
+case "${1:-run}" in
+    run) set -- "$@" -web "$WEB_ADDR" ;;
+esac
 
 if [ -n "${PUID:-}" ] && [ -n "${PGID:-}" ]; then
     echo "[entrypoint] 以 UID=${PUID} GID=${PGID} 运行"

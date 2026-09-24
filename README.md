@@ -10,6 +10,7 @@
 3. **最大运行时长保护** — 到达设定时长后自动停止容器。
 4. **媒体转码** — 监控目录中的视频/音频文件用 ffmpeg 转为 MP3（单声道 / 22050Hz）。
 5. **过期文件归档** — 早于阈值的 MP3 自动移入 `历史` 子目录。
+6. **Web 管理界面** — 浏览器里增删改定时任务、查看运行状态、调整全局设置，改动即时生效并写回磁盘。
 
 ## 与原脚本的对应关系
 
@@ -21,7 +22,7 @@
 | `threading.Thread` + `Event` | goroutine + `context.Context` | 用 context 取消替代 Event 信号，避免竞态 |
 | `re.compile(r'[\x00-\x1F\x7F]')` | `monitor.CleanLogLine` | 逐 rune 扫描，保留制表符 |
 | `shutil.move` | `media.moveFile` | 先 `rename`，跨分区时回退为复制 + 删除 |
-| 硬编码 `CONTAINERS_CONFIG` | `config.json` | 配置外置，支持校验、容器级关键词覆盖 |
+| 硬编码 `CONTAINERS_CONFIG` | `config.json` + Web 界面 | 配置外置，支持校验、容器级关键词覆盖、运行时热更新 |
 
 ## 快速开始
 
@@ -32,7 +33,7 @@ go run ./cmd/livemonitor init -config config.json
 # 2. 校验配置（会打印解析结果与生效参数）
 go run ./cmd/livemonitor check -config config.json
 
-# 3. 启动服务
+# 3. 启动服务（默认开启 Web 管理界面 :8080）
 go run ./cmd/livemonitor run -config config.json -log-level info
 ```
 
@@ -45,7 +46,7 @@ make build            # 产出 bin/livemonitor
 ## 命令行
 
 ```
-livemonitor run     启动监控服务
+livemonitor run     启动监控服务（含 Web 管理界面）
 livemonitor init    生成默认配置文件
 livemonitor check   校验配置并打印摘要
 livemonitor probe   查看 MP3 文件码率等参数
@@ -53,6 +54,41 @@ livemonitor version 查看版本
 ```
 
 通用选项：`-config <路径>`、`-log-level debug|info|warn|error`。
+
+`run` 专属选项：
+
+| 选项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-web <地址>` | `:8080` | Web 管理界面监听地址，填 `off` 可禁用 |
+| `-force` | `false` | 配置校验失败时仍尝试启动（仅告警） |
+
+## Web 管理界面
+
+启动后访问 `http://<主机>:8080` 即可管理定时任务，无需手工编辑 JSON。
+
+![Web 管理界面](docs/web-ui.png)
+
+能做什么：
+
+| 区域 | 功能 |
+| --- | --- |
+| 运行概览 | 启动时间、已运行时长、媒体目录、待转码队列、服务器时间与配置文件路径 |
+| 容器定时任务 | 每个容器的每日启动时刻、最长运行时长、运行状态与剩余时间、下次启动倒计时 |
+| 容器操作 | **立即启动**（跳过计划手动跑一次）、**停止**、**编辑**、**删除** |
+| 全局设置 | 监控目录、归档目录、扫描间隔、静置阈值、归档阈值、MP3 码率、全局关键词 |
+| 重载配置 | 手工改完 `config.json` 后一键热应用，不必重启进程 |
+
+设计要点：
+
+- 所有写操作都**先落盘再热应用**。配置通过「写临时文件 + `rename`」原子替换，避免写一半损坏配置。
+- 启动时刻在保存时自动**去空白、去重、升序**；容器名重复视为更新而非新增。
+- 编辑某个容器的时刻后，该容器的旧调度任务会被精确摘除再重建，不会残留已删除的时间点。
+- 页面每 5 秒自动刷新；配置为纯静态 HTML（`go:embed` 内嵌），单文件二进制即可运行。
+- 路径参数按原始编码（`EscapedPath`）切分，容器名中的非法字符（`/`、`\`、`..`）会被拒绝。
+
+> ⚠️ **该界面没有任何鉴权**，任何能访问该端口的人都可以启停你的容器、修改配置。
+> Docker 部署时默认只绑定 `127.0.0.1`，需要远程访问请自行加反向代理与访问控制，
+> 或把 `LIVEMONITOR_WEB_ADDR` 设为 `off` 关闭界面。
 
 ## 配置说明
 
@@ -86,6 +122,7 @@ docker run -d --name livemonitor \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v /你的媒体目录:/audio \
   -v /你的配置目录:/config \
+  -p 127.0.0.1:8080:8080 \
   -e TZ=Asia/Shanghai \
   -e PUID=1000 -e PGID=1000 \
   --restart unless-stopped \
@@ -100,6 +137,16 @@ docker compose up -d
 
 **必须挂载 `/var/run/docker.sock`**，否则无法控制宿主机容器（媒体转码仍可工作）。
 
+环境变量：
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `LIVEMONITOR_CONFIG` | `/config/config.json` | 配置文件路径 |
+| `LIVEMONITOR_LOG_LEVEL` | `info` | 日志级别 |
+| `LIVEMONITOR_WEB_ADDR` | `:8080` | Web 界面监听地址，设为 `off` 禁用 |
+| `TZ` | `Asia/Shanghai` | 时区（影响所有定时任务的判定） |
+| `PUID` / `PGID` | 未设置 | 同时设置则以该 UID/GID 运行，便于处理挂载目录属主 |
+
 ## 测试
 
 ```bash
@@ -107,8 +154,11 @@ make test              # 全部单元测试
 make test-race         # 竞态检测
 ```
 
-测试不依赖网络与真实 docker：`internal/monitor` 使用假的 Runner 与可控日志流驱动关键词匹配；
-`internal/media` 在 ffmpeg 可用时生成真实音频文件验证码率解析与转码产物。
+测试不依赖网络与真实 docker：
+`internal/monitor` 使用假的 Runner 与可控日志流驱动关键词匹配；
+`internal/media` 在 ffmpeg 可用时生成真实音频文件验证码率解析与转码产物；
+`internal/runtime` 验证配置热更新的原子落盘与并发安全；
+`internal/web` 通过假控制器覆盖全部 HTTP 接口（含错误路径与路径穿越防护）。
 
 ## 项目结构
 
@@ -118,8 +168,10 @@ internal/cli/             子命令与参数解析
 internal/config/          配置定义、加载、校验
 internal/logging/         带作用域前缀的并发安全日志
 internal/dockerctl/       docker CLI 封装（同步 + 流式）
-internal/scheduler/       每日定点调度
+internal/scheduler/       每日定点调度（支持按 ID 精确增删）
 internal/monitor/         容器生命周期监控
 internal/media/           MP3 解析、ffmpeg 转码、目录扫描与归档
-internal/manager/         编排各组件与信号处理
+internal/runtime/         可热更新的并发安全配置存储（原子落盘）
+internal/web/             Web 管理界面与 JSON API（go:embed 内嵌页面）
+internal/manager/         编排各组件、Web 服务与信号处理
 ```

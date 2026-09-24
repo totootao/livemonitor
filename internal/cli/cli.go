@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/totootao/livemonitor/internal/config"
 	"github.com/totootao/livemonitor/internal/logging"
@@ -30,6 +29,11 @@ import (
 var Version = "1.0.0"
 
 const defaultConfigPath = "config.json"
+
+// defaultWebAddr 是 Web 管理界面的默认监听地址。
+// 端口选在 8080：容器内通常无需额外映射即可访问，
+// 需要对外暴露时用 -p 映射或改 -web 即可。
+const defaultWebAddr = ":8080"
 
 // Run 解析参数并执行对应子命令。
 func Run(ctx context.Context, args ...string) error {
@@ -66,7 +70,7 @@ func printUsage() {
   livemonitor <命令> [选项]
 
 命令:
-  run       启动监控服务（定时启动容器、日志监控、媒体转码与归档）
+  run       启动监控服务（Web 管理界面 + 定时启动容器、日志监控、媒体转码与归档）
   init      生成默认配置文件
   check     校验配置文件并打印解析结果
   probe     查看 MP3 文件的码率等音频参数
@@ -76,10 +80,15 @@ func printUsage() {
 通用选项:
   -config <路径>   配置文件路径，默认 config.json
 
+run 专属选项:
+  -web <地址>      Web 管理界面监听地址，默认 :8080；填 off 可禁用
+  -force           配置校验失败时仍尝试启动（仅告警）
+
 示例:
   livemonitor init -config config.json
   livemonitor check -config config.json
-  livemonitor run   -config config.json -log-level info
+  livemonitor run   -config config.json -log-level info -web :8080
+  livemonitor run   -web 127.0.0.1:9000
   livemonitor probe -file /audio/example.mp3
 `)
 }
@@ -182,6 +191,7 @@ func runCmd(parent context.Context, args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	cf := parseCommon(fs)
 	force := fs.Bool("force", false, "跳过对配置的严格校验（仅告警）")
+	webAddr := fs.String("web", defaultWebAddr, "Web 管理界面监听地址，如 :8080；设为 off 可禁用")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -204,7 +214,7 @@ func runCmd(parent context.Context, args []string) error {
 	}
 	cfg.LogSummary(log)
 
-	mgr, err := manager.New(cfg, log)
+	mgr, err := manager.New(cfg, cf.config, log)
 	if err != nil {
 		return err
 	}
@@ -218,10 +228,9 @@ func runCmd(parent context.Context, args []string) error {
 		cancel()
 	}()
 
-	code := mgr.Run(ctx)
+	code := mgr.Run(ctx, *webAddr)
 	if code != 0 {
 		os.Exit(code)
 	}
-	_ = time.Now
 	return nil
 }

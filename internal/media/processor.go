@@ -198,6 +198,9 @@ func (p *Processor) WatchDir() string { return p.watchDir }
 // HistoryDir 返回归档目录。
 func (p *Processor) HistoryDir() string { return p.historyDir }
 
+// Pending 返回待转码队列长度，供 Web 界面展示。
+func (p *Processor) Pending() int { return p.queue.Len() }
+
 // Start 启动扫描与转码工作协程。
 func (p *Processor) Start(parent context.Context) {
 	p.mu.Lock()

@@ -1,0 +1,713 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>livemonitor 定时任务管理</title>
+<style>
+  :root {
+    --bg: #f5f6f8;
+    --panel: #ffffff;
+    --panel-2: #fafbfc;
+    --border: #e2e5ea;
+    --text: #1f2329;
+    --muted: #6b7280;
+    --accent: #2563eb;
+    --accent-soft: #e8f0fe;
+    --ok: #16a34a;
+    --ok-soft: #e7f6ec;
+    --warn: #d97706;
+    --warn-soft: #fdf3e3;
+    --err: #dc2626;
+    --err-soft: #fdeaea;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 12px rgba(16, 24, 40, .05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14161a;
+      --panel: #1c1f26;
+      --panel-2: #22262e;
+      --border: #2e333d;
+      --text: #e6e8ec;
+      --muted: #9aa1ad;
+      --accent: #5b8def;
+      --accent-soft: #1e2a44;
+      --ok: #4ade80;
+      --ok-soft: #16301f;
+      --warn: #fbbf24;
+      --warn-soft: #33280f;
+      --err: #f87171;
+      --err-soft: #3a1a1a;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 12px rgba(0, 0, 0, .25);
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+          "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); }
+  code, .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    font-size: .92em;
+  }
+
+  header.topbar {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--panel) 88%, transparent);
+    backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+    padding: 12px 20px;
+  }
+  .topbar-inner {
+    max-width: 1280px; margin: 0 auto;
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  }
+  .brand { font-size: 16px; font-weight: 650; letter-spacing: .2px; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .topbar-spacer { flex: 1; }
+  .stat-inline { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
+  .stat-inline b { color: var(--text); font-weight: 600; }
+
+  main { max-width: 1280px; margin: 0 auto; padding: 20px; display: grid; gap: 20px; }
+
+  section.card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .card-head {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel-2);
+  }
+  .card-head h2 { margin: 0; font-size: 15px; font-weight: 620; }
+  .card-head .hint { color: var(--muted); font-size: 12px; }
+  .card-head .spacer { flex: 1; }
+  .card-body { padding: 16px; }
+
+  button, .btn {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    padding: 7px 13px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background .12s, border-color .12s, opacity .12s;
+    white-space: nowrap;
+  }
+  button:hover:not(:disabled) { background: var(--panel-2); border-color: var(--muted); }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+  button.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
+  button.danger:hover:not(:disabled) { background: var(--err-soft); }
+  button.tiny { padding: 4px 9px; font-size: 12px; border-radius: 6px; }
+
+  input, select {
+    font: inherit;
+    background: var(--panel);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 10px;
+    width: 100%;
+  }
+  input:focus, select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+  label.field { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
+  label.field > span { font-weight: 500; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  th { font-size: 12px; color: var(--muted); font-weight: 600; background: var(--panel-2); white-space: nowrap; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: color-mix(in srgb, var(--accent-soft) 35%, transparent); }
+  td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
+
+  .tag {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 2px 8px; border-radius: 999px; font-size: 12px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--muted);
+  }
+  .tag.ok { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 35%, transparent); }
+  .tag.warn { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 35%, transparent); }
+  .tag.err { color: var(--err); background: var(--err-soft); border-color: color-mix(in srgb, var(--err) 35%, transparent); }
+  .tag.accent { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 35%, transparent); }
+  .times { display: flex; gap: 5px; flex-wrap: wrap; }
+  .times .tag { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+  .empty { text-align: center; color: var(--muted); padding: 36px 12px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+  .kv { display: grid; gap: 3px; }
+  .kv .k { color: var(--muted); font-size: 12px; }
+  .kv .v { font-weight: 560; }
+  .row-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
+
+  dialog {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 0;
+    background: var(--panel);
+    color: var(--text);
+    width: min(560px, 94vw);
+    box-shadow: 0 20px 50px rgba(0, 0, 0, .25);
+  }
+  dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  .dialog-head { padding: 16px 18px 0; font-weight: 620; font-size: 15px; }
+  .dialog-body { padding: 16px 18px; display: grid; gap: 14px; }
+  .dialog-foot {
+    padding: 14px 18px; border-top: 1px solid var(--border);
+    display: flex; gap: 10px; justify-content: flex-end; background: var(--panel-2);
+  }
+  .field-error { color: var(--err); font-size: 12px; min-height: 1.2em; }
+  .help { color: var(--muted); font-size: 12px; margin-top: -8px; }
+
+  #toasts {
+    position: fixed; right: 18px; bottom: 18px; z-index: 100;
+    display: grid; gap: 8px; max-width: min(420px, 90vw);
+  }
+  .toast {
+    padding: 10px 14px; border-radius: 9px; border: 1px solid var(--border);
+    background: var(--panel); box-shadow: var(--shadow); font-size: 13px;
+    animation: slide-in .18s ease-out;
+  }
+  .toast.ok { border-left: 3px solid var(--ok); }
+  .toast.err { border-left: 3px solid var(--err); }
+  .toast.info { border-left: 3px solid var(--accent); }
+  @keyframes slide-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  .swatch { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .dot-ok { background: var(--ok); }
+  .dot-idle { background: var(--muted); }
+  .spin { display: inline-block; animation: spin 1s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">livemonitor <small>定时任务管理</small></div>
+    <div class="topbar-spacer"></div>
+    <div class="stat-inline" id="statLine"></div>
+    <button id="btnRefresh" title="立即刷新（页面每 5 秒自动刷新）">刷新</button>
+  </div>
+</header>
+
+<main>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>运行概览</h2>
+      <span class="hint">数据每 5 秒自动刷新</span>
+      <div class="spacer"></div>
+      <button id="btnReload" title="从磁盘重新读取 config.json 并热应用">重载配置</button>
+    </div>
+    <div class="card-body">
+      <div class="grid-3" id="overview"></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>容器定时任务</h2>
+      <span class="hint" id="containerCount"></span>
+      <div class="spacer"></div>
+      <input id="filter" placeholder="按名称过滤…" style="width:200px" autocomplete="off">
+      <button class="primary" id="btnAdd">新增容器</button>
+    </div>
+    <div class="card-body" style="padding:0">
+      <table>
+        <thead>
+          <tr>
+            <th style="width:190px">容器名</th>
+            <th>每日启动时刻</th>
+            <th style="width:120px">最长运行</th>
+            <th style="width:110px">状态</th>
+            <th style="width:170px">下次启动</th>
+            <th style="width:300px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+      <div class="empty" id="emptyHint" hidden>暂无容器，点击「新增容器」开始配置。</div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>全局设置</h2>
+      <span class="hint">修改后会立即写入配置文件并热应用</span>
+    </div>
+    <div class="card-body">
+      <form id="settingsForm" class="grid-3">
+        <label class="field"><span>监控目录</span><input name="watchDir" required></label>
+        <label class="field"><span>归档目录（留空则取 监控目录/历史）</span><input name="historyDir"></label>
+        <label class="field"><span>扫描间隔（秒）</span><input name="checkInterval" type="number" min="1" required></label>
+        <label class="field"><span>静置阈值（秒）</span><input name="stableDelay" type="number" min="0" required></label>
+        <label class="field"><span>归档阈值（小时）</span><input name="archiveAfterHours" type="number" min="1" required></label>
+        <label class="field"><span>MP3 输出码率</span>
+          <select name="mp3Bitrate">
+            <option>16k</option><option>24k</option><option>32k</option>
+            <option>48k</option><option>64k</option><option>96k</option><option>128k</option>
+          </select>
+        </label>
+        <label class="field" style="grid-column:1/-1"><span>全局监控关键词（逗号分隔，命中即停止容器）</span><input name="monitorKeywords"></label>
+        <div style="grid-column:1/-1" class="row-actions">
+          <button class="primary" type="submit">保存设置</button>
+          <span class="help" id="configPath"></span>
+        </div>
+      </form>
+    </div>
+  </section>
+
+</main>
+
+<dialog id="dlg">
+  <form method="dialog">
+    <div class="dialog-head" id="dlgTitle">编辑容器</div>
+    <div class="dialog-body">
+      <label class="field">
+        <span>容器名</span>
+        <input id="fName" required placeholder="docker 容器名，例如 zhangsan">
+      </label>
+      <label class="field">
+        <span>每日启动时刻</span>
+        <input id="fTimes" required placeholder="20:01 或 17:03,17:13,17:33">
+      </label>
+      <div class="help">多个时刻用英文逗号分隔，格式 HH:MM，保存时会自动去重排序。</div>
+      <label class="field">
+        <span>最长运行时长</span>
+        <input id="fDur" required placeholder="10800 或 3h / 90m">
+      </label>
+      <div class="help">支持纯秒数，或 <code>3h</code>、<code>90m</code>、<code>45s</code> 写法。</div>
+      <label class="field">
+        <span>专属监控关键词（留空则继承全局）</span>
+        <input id="fKw" placeholder="等待直播,已结束">
+      </label>
+      <div class="field-error" id="dlgErr"></div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" id="dlgCancel">取消</button>
+      <button type="submit" class="primary" id="dlgSave">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<div id="toasts"></div>
+
+<script>
+"use strict";
+
+// ---- 工具函数 ----
+
+const $ = (sel) => document.querySelector(sel);
+
+function toast(msg, kind = "info", ms = 3600) {
+  const el = document.createElement("div");
+  el.className = "toast " + kind;
+  el.textContent = msg;
+  $("#toasts").appendChild(el);
+  setTimeout(() => el.remove(), ms);
+}
+
+async function api(method, path, body) {
+  const init = { method, headers: {} };
+  if (body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(body);
+  }
+  const res = await fetch(path, init);
+  const text = await res.text();
+  let data = null;
+  if (text) {
+    try { data = JSON.parse(text); } catch (_) { data = { error: text }; }
+  }
+  if (!res.ok) {
+    throw new Error((data && data.error) || ("HTTP " + res.status));
+  }
+  return data;
+}
+
+function pad(n) { return String(n).padStart(2, "0"); }
+
+function fmtDuration(sec) {
+  sec = Math.max(0, Math.floor(sec || 0));
+  if (sec < 60) return sec + "秒";
+  if (sec < 3600) return Math.floor(sec / 60) + "分" + (sec % 60) + "秒";
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  return m === 0 ? h + "小时" : h + "小时" + m + "分";
+}
+
+function fmtClock(d) {
+  const t = new Date(d);
+  if (isNaN(t.getTime())) return "—";
+  return pad(t.getHours()) + ":" + pad(t.getMinutes());
+}
+
+// 相对时间：3秒后 / 2小时15分后
+function fmtRelative(d) {
+  const t = new Date(d);
+  if (isNaN(t.getTime())) return "—";
+  let diff = Math.round((t - Date.now()) / 1000);
+  if (diff <= 0) return "即将";
+  if (diff < 60) return diff + " 秒后";
+  if (diff < 3600) return Math.floor(diff / 60) + " 分 " + (diff % 60) + " 秒后";
+  const h = Math.floor(diff / 3600);
+  const m = Math.floor((diff % 3600) / 60);
+  return h + " 小时 " + m + " 分后";
+}
+
+function el(tag, attrs = {}, children = []) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v;
+    else if (k === "text") node.textContent = v;
+    else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    // 布尔属性必须用 property 赋值，不能用 setAttribute。
+    // 反例：setAttribute("disabled", false) 会写出 disabled="false"，
+    // 而 HTML 布尔属性只看"存在与否"，按钮仍会被禁用。
+    else if (k === "disabled") node.disabled = !!v;
+    else if (v !== null && v !== undefined) node.setAttribute(k, v);
+  }
+  for (const c of [].concat(children)) {
+    if (c === null || c === undefined) continue;
+    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
+  }
+  return node;
+}
+
+// ---- 状态渲染 ----
+
+let state = null;
+let busy = new Set();   // 正在操作中的容器名
+let dirtyForm = false;  // 用户正在编辑设置时不要覆盖
+
+function render() {
+  if (!state) return;
+
+  // 顶栏
+  const running = state.containers.filter((c) => c.running).length;
+  $("#statLine").replaceChildren(
+    el("span", {}, [el("b", { text: String(state.containers.length) }), " 个容器"]),
+    el("span", {}, [el("b", { text: String(state.jobsTotal) }), " 个定时任务"]),
+    el("span", {}, [el("b", { text: String(running) }), " 个运行中"]),
+    el("span", { text: "时区 " + state.timezone }),
+  );
+
+  // 概览
+  const uptime = state.uptimeSeconds;
+  $("#overview").replaceChildren(
+    el("div", { class: "kv" }, [
+      el("div", { class: "k", text: "服务启动时间" }),
+      el("div", { class: "v mono", text: new Date(state.startedAt).toLocaleString() }),
+      el("div", { class: "k", text: "已运行 " + fmtDuration(uptime) }),
+    ]),
+    el("div", { class: "kv" }, [
+      el("div", { class: "k", text: "媒体目录" }),
+      el("div", { class: "v mono", text: state.video.watchDir || "—" }),
+      el("div", { class: "k", text: "归档目录 " + (state.video.historyDir || "—") }),
+    ]),
+    el("div", { class: "kv" }, [
+      el("div", { class: "k", text: "待转码队列" }),
+      el("div", { class: "v", text: state.video.pending + " 个文件" }),
+      el("div", { class: "k", text: "输出码率 " + state.settings.mp3Bitrate }),
+    ]),
+    el("div", { class: "kv" }, [
+      el("div", { class: "k", text: "服务器时间" }),
+      el("div", { class: "v mono", text: new Date(state.serverTime).toLocaleString() }),
+      el("div", { class: "k", text: "配置文件 " + state.settings.configPath }),
+    ]),
+  );
+
+  renderContainers();
+  renderSettings();
+}
+
+function renderContainers() {
+  const filter = ($("#filter").value || "").trim().toLowerCase();
+  const list = state.containers.filter(
+    (c) => !filter || c.name.toLowerCase().includes(filter)
+  );
+
+  $("#containerCount").textContent = filter
+    ? "匹配 " + list.length + " / " + state.containers.length
+    : "共 " + state.containers.length + " 个";
+
+  const tbody = $("#tbody");
+  tbody.replaceChildren();
+  $("#emptyHint").hidden = list.length > 0;
+
+  for (const c of list) {
+    const isBusy = busy.has(c.name);
+
+    // 启动时刻
+    const times = (c.startTimes && c.startTimes.length)
+      ? el("div", { class: "times" }, c.startTimes.map((t) => el("span", { class: "tag", text: t })))
+      : el("span", { class: "tag warn", text: "未设置（不会自动启动）" });
+
+    // 状态
+    let status;
+    if (c.running) {
+      status = el("span", { class: "tag ok" }, [
+        el("span", { class: "swatch dot-ok" }),
+        "运行中 " + fmtDuration(c.elapsedSeconds),
+      ]);
+    } else {
+      status = el("span", { class: "tag" }, [
+        el("span", { class: "swatch dot-idle" }),
+        "空闲",
+      ]);
+    }
+
+    // 下次启动
+    let next;
+    if (c.nextRun && new Date(c.nextRun).getFullYear() > 1) {
+      next = el("div", { class: "kv" }, [
+        el("div", { class: "v mono", text: fmtClock(c.nextRun) }),
+        el("div", { class: "k", text: fmtRelative(c.nextRun) }),
+      ]);
+    } else {
+      next = el("span", { class: "tag", text: "—" });
+    }
+
+    const actions = el("td", { class: "actions" }, [
+      el("button", {
+        class: "tiny primary", text: "立即启动", disabled: isBusy || c.running,
+        title: "跳过定时计划，立刻启动该容器",
+        onclick: () => act(c.name, "run-now"),
+      }),
+      el("button", {
+        class: "tiny danger", text: "停止", disabled: isBusy || !c.running,
+        title: "停止正在运行的容器",
+        onclick: () => act(c.name, "stop"),
+      }),
+      el("button", {
+        class: "tiny", text: "编辑", disabled: isBusy,
+        onclick: () => openDialog(c),
+      }),
+      el("button", {
+        class: "tiny danger", text: "删除", disabled: isBusy,
+        onclick: () => removeContainer(c.name),
+      }),
+    ]);
+
+    // 最长运行时长 + 剩余时间提示
+    const durCell = el("td", {}, [
+      el("div", { class: "mono", text: fmtDuration(c.maxRunDuration) }),
+      c.running
+        ? el("div", { class: "k", style: "color:var(--muted);font-size:12px",
+                      text: "剩余 " + fmtDuration(c.remainingSeconds) })
+        : null,
+    ]);
+
+    // 关键词提示（专属/继承全局）
+    const nameCell = el("td", {}, [
+      el("div", { class: "mono", style: "font-weight:600", text: c.name }),
+      c.keywords && c.keywords.length
+        ? el("div", { style: "color:var(--muted);font-size:12px", text: "关键词: " + c.keywords.join(" / ") })
+        : el("div", { style: "color:var(--muted);font-size:12px", text: "继承全局关键词" }),
+    ]);
+
+    tbody.appendChild(el("tr", {}, [
+      nameCell,
+      el("td", {}, [times]),
+      durCell,
+      el("td", {}, [status]),
+      el("td", {}, [next]),
+      actions,
+    ]));
+  }
+}
+
+function renderSettings() {
+  if (dirtyForm) return;   // 用户正在编辑，别覆盖输入
+  const f = $("#settingsForm");
+  const s = state.settings;
+  f.watchDir.value = s.watchDir || "";
+  f.historyDir.value = s.historyDir || "";
+  f.checkInterval.value = s.checkInterval;
+  f.stableDelay.value = s.stableDelay;
+  f.archiveAfterHours.value = s.archiveAfterHours;
+  f.mp3Bitrate.value = s.mp3Bitrate;
+  f.monitorKeywords.value = (s.monitorKeywords || []).join(",");
+  $("#configPath").textContent = "配置文件：" + s.configPath;
+}
+
+// ---- 操作 ----
+
+async function act(name, action) {
+  busy.add(name);
+  renderContainers();
+  try {
+    const res = await api("POST", "/api/containers/" + encodeURIComponent(name) + "/" + action);
+    const label = { "run-now": "已触发启动", "start": "已触发启动", "stop": "已触发停止" }[action] || res.status;
+    toast(name + " " + label, "ok");
+  } catch (e) {
+    toast(name + " 操作失败：" + e.message, "err");
+  } finally {
+    busy.delete(name);
+    await refresh();
+  }
+}
+
+async function removeContainer(name) {
+  if (!confirm("确认删除容器「" + name + "」？\n\n该容器的定时任务会一并移除；若正在运行会先停止。")) return;
+  busy.add(name);
+  renderContainers();
+  try {
+    await api("DELETE", "/api/containers/" + encodeURIComponent(name));
+    toast("已删除 " + name, "ok");
+  } catch (e) {
+    toast("删除失败：" + e.message, "err");
+  } finally {
+    busy.delete(name);
+    await refresh();
+  }
+}
+
+// ---- 编辑弹窗 ----
+
+let editingName = null;
+
+function openDialog(c) {
+  editingName = c ? c.name : null;
+  $("#dlgTitle").textContent = c ? "编辑容器 · " + c.name : "新增容器";
+  $("#fName").value = c ? c.name : "";
+  $("#fName").disabled = !!c;   // 容器名即标识，编辑时不允许改名
+  $("#fTimes").value = c && c.startTimes ? c.startTimes.join(",") : "";
+  $("#fDur").value = c && c.maxRunDuration ? String(c.maxRunDuration) : "10800";
+  $("#fKw").value = c && c.keywords ? c.keywords.join(",") : "";
+  $("#dlgErr").textContent = "";
+  $("#dlg").showModal();
+  setTimeout(() => $("#fTimes").focus(), 30);
+}
+
+function parseTimes(raw) {
+  return raw.split(/[,，\s]+/).map((s) => s.trim()).filter(Boolean).map((s) => {
+    const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(s);
+    if (!m) throw new Error("时刻格式不正确：" + s + "（应为 HH:MM）");
+    const h = Number(m[1]), min = Number(m[2]);
+    if (h > 23 || min > 59) throw new Error("时刻超出范围：" + s);
+    return pad(h) + ":" + pad(min);
+  });
+}
+
+async function saveDialog(e) {
+  e.preventDefault();
+  const errBox = $("#dlgErr");
+  errBox.textContent = "";
+
+  let times;
+  try {
+    times = parseTimes($("#fTimes").value);
+    if (times.length === 0) throw new Error("至少填写一个启动时刻");
+  } catch (err) {
+    errBox.textContent = err.message;
+    return;
+  }
+
+  const durRaw = $("#fDur").value.trim();
+  const kws = $("#fKw").value.split(/[,，]+/).map((s) => s.trim()).filter(Boolean);
+
+  const payload = {
+    name: $("#fName").value.trim(),
+    startTimes: times,
+    maxRunDuration: durRaw,
+    keywords: kws,
+  };
+
+  if (!payload.name) {
+    errBox.textContent = "容器名不能为空";
+    return;
+  }
+
+  $("#dlgSave").disabled = true;
+  try {
+    const path = editingName
+      ? "/api/containers/" + encodeURIComponent(editingName)
+      : "/api/containers";
+    await api(editingName ? "PUT" : "POST", path, payload);
+    toast("已保存 " + payload.name, "ok");
+    $("#dlg").close();
+    await refresh();
+  } catch (err) {
+    errBox.textContent = err.message;
+  } finally {
+    $("#dlgSave").disabled = false;
+  }
+}
+
+// ---- 设置表单 ----
+
+async function saveSettings(e) {
+  e.preventDefault();
+  const f = $("#settingsForm");
+  const payload = {
+    watchDir: f.watchDir.value.trim(),
+    historyDir: f.historyDir.value.trim(),
+    checkInterval: Number(f.checkInterval.value),
+    stableDelay: Number(f.stableDelay.value),
+    archiveAfterHours: Number(f.archiveAfterHours.value),
+    mp3Bitrate: f.mp3Bitrate.value,
+    monitorKeywords: f.monitorKeywords.value.split(/[,，]+/).map((s) => s.trim()).filter(Boolean),
+  };
+  try {
+    await api("PUT", "/api/settings", payload);
+    toast("设置已保存并生效", "ok");
+    dirtyForm = false;
+    await refresh();
+  } catch (err) {
+    toast("保存失败：" + err.message, "err");
+  }
+}
+
+// ---- 轮询 ----
+
+async function refresh() {
+  try {
+    state = await api("GET", "/api/state");
+    render();
+  } catch (e) {
+    toast("获取状态失败：" + e.message, "err", 5000);
+  }
+}
+
+function init() {
+  $("#btnRefresh").addEventListener("click", refresh);
+  $("#btnAdd").addEventListener("click", () => openDialog(null));
+  $("#filter").addEventListener("input", renderContainers);
+  $("#dlgCancel").addEventListener("click", () => $("#dlg").close());
+  $("#dlg").addEventListener("submit", saveDialog);
+  $("#settingsForm").addEventListener("submit", saveSettings);
+  $("#settingsForm").addEventListener("input", () => { dirtyForm = true; });
+
+  $("#btnReload").addEventListener("click", async () => {
+    try {
+      await api("POST", "/api/reload");
+      toast("已从磁盘重载配置", "ok");
+      dirtyForm = false;
+      await refresh();
+    } catch (e) {
+      toast("重载失败：" + e.message, "err");
+    }
+  });
+
+  refresh();
+  setInterval(refresh, 5000);
+}
+
+document.addEventListener("DOMContentLoaded", init);
+</script>
+</body>
+</html>

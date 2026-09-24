@@ -7,7 +7,7 @@ IMAGE_TAG  ?= $(VERSION)
 PKG        := github.com/totootao/livemonitor/internal/cli
 LDFLAGS    := -s -w -X $(PKG).Version=$(VERSION)
 
-.PHONY: all build test test-race vet fmt lint clean run init check docker docker-run compose-up compose-down help
+.PHONY: all build test test-race vet fmt lint clean run init check web docker docker-run compose-up compose-down help
 all: fmt vet test build
 
 ## build: 编译单文件二进制到 bin/
@@ -46,9 +46,13 @@ init:
 check:
 	go run $(CMD_PKG) check -config config.json
 
-## run: 本地运行服务
+## run: 本地运行服务（含 Web 管理界面）
 run:
-	go run $(CMD_PKG) run -config config.json -log-level info
+	go run $(CMD_PKG) run -config config.json -log-level info -web :8080
+
+## web: 构建后本地启动服务，方便直接打开 http://localhost:8080
+web: build
+	./$(BIN_DIR)/$(BINARY) run -config config.json -log-level info -web :8080
 
 ## docker: 构建镜像
 docker:
@@ -60,6 +64,7 @@ docker-run:
 		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v /audio:/audio \
 		-v $(PWD)/docker-config:/config \
+		-p 127.0.0.1:8080:8080 \
 		-e TZ=Asia/Shanghai \
 		--restart unless-stopped \
 		$(IMAGE):$(IMAGE_TAG)

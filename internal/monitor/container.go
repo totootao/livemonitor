@@ -85,6 +85,52 @@ func (m *ContainerMonitor) IsRunning() bool {
 	return m.running
 }
 
+// Status 返回运行状态的快照，供 Web 界面展示。
+func (m *ContainerMonitor) Status() Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	st := Status{
+		Name:        m.name,
+		Running:     m.running,
+		Keywords:    append([]string(nil), m.keywords...),
+		MaxDuration: int(m.maxDuration.Seconds()),
+	}
+	if m.running && !m.started.IsZero() {
+		st.StartedAt = m.started
+		st.ElapsedSeconds = int(time.Since(m.started).Seconds())
+		st.RemainingSeconds = int(m.maxDuration.Seconds()) - st.ElapsedSeconds
+		if st.RemainingSeconds < 0 {
+			st.RemainingSeconds = 0
+		}
+	}
+	return st
+}
+
+// Status 是容器状态的只读快照。
+type Status struct {
+	Name             string    `json:"name"`
+	Running          bool      `json:"running"`
+	StartedAt        time.Time `json:"startedAt"`
+	ElapsedSeconds   int       `json:"elapsedSeconds"`
+	RemainingSeconds int       `json:"remainingSeconds"`
+	MaxDuration      int       `json:"maxDuration"`
+	Keywords         []string  `json:"keywords"`
+}
+
+// Update 热更新该容器的运行参数。已启动的容器仅在下次启动时生效于时长计时。
+func (m *ContainerMonitor) Update(cc config.ContainerConfig, globalKeywords []string) {
+	kw := []string(cc.Keywords)
+	if len(kw) == 0 {
+		kw = append(kw, globalKeywords...)
+	}
+	m.mu.Lock()
+	m.keywords = kw
+	m.maxDuration = time.Duration(cc.MaxRunDuration) * time.Second
+	m.mu.Unlock()
+	m.log.Info("已更新容器参数：关键词 %s，最长运行 %s",
+		strings.Join(kw, ", "), config.FormatDuration(cc.MaxRunDuration))
+}
+
 // Start 启动容器；若已在运行则忽略（保留原脚本的幂等语义）。
 func (m *ContainerMonitor) Start() {
 	m.mu.Lock()
@@ -254,8 +300,10 @@ func (m *ContainerMonitor) matchAndStop(line string, gen uint64) bool {
 		return true
 	}
 	m.mu.Unlock()
+	// 在同一把锁内取出关键词快照，避免与 Update 并发读写。
+	keywords := append([]string(nil), m.keywords...)
 
-	for _, kw := range m.keywords {
+	for _, kw := range keywords {
 		if kw != "" && strings.Contains(cleaned, kw) {
 			m.log.Info("检测到关键词: %s", kw)
 			m.Stop(StopReason("命中日志关键词 '" + kw + "'"))
@@ -267,8 +315,12 @@ func (m *ContainerMonitor) matchAndStop(line string, gen uint64) bool {
 
 // enforceMaxDuration 到达最大运行时长后停止容器。
 func (m *ContainerMonitor) enforceMaxDuration(ctx context.Context, gen uint64, done chan struct{}) {
-	m.log.Info("将在 %s 后自动停止", config.FormatDuration(int(m.maxDuration.Seconds())))
-	timer := time.NewTimer(m.maxDuration)
+	m.mu.Lock()
+	maxDuration := m.maxDuration
+	m.mu.Unlock()
+
+	m.log.Info("将在 %s 后自动停止", config.FormatDuration(int(maxDuration.Seconds())))
+	timer := time.NewTimer(maxDuration)
 	defer timer.Stop()
 
 	select {
@@ -283,7 +335,7 @@ func (m *ContainerMonitor) enforceMaxDuration(ctx context.Context, gen uint64, d
 		if stale {
 			return
 		}
-		m.Stop(StopReason("达到最大运行时长 " + config.FormatDuration(int(m.maxDuration.Seconds()))))
+		m.Stop(StopReason("达到最大运行时长 " + config.FormatDuration(int(maxDuration.Seconds()))))
 	}
 }
 

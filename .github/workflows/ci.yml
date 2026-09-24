@@ -40,3 +40,19 @@ jobs:
 
       - name: 编译
         run: CGO_ENABLED=0 go build -trimpath -o bin/livemonitor ./cmd/livemonitor
+
+      - name: 校验内嵌资源可用
+        # go:embed 指向的文件缺失会导致编译失败，但路径写错而文件恰好存在时
+        # 只有运行期才会暴露。这里直接起服务拉一次首页，确认页面确实被内嵌进二进制。
+        run: |
+          ./bin/livemonitor init -config /tmp/ci-config.json
+          ./bin/livemonitor run -config /tmp/ci-config.json -web 127.0.0.1:18099 &
+          SRV=$!
+          for i in $(seq 1 20); do
+            sleep 0.5
+            if curl -sf -o /tmp/ci-index.html http://127.0.0.1:18099/; then break; fi
+          done
+          kill $SRV 2>/dev/null || true
+          grep -q "<!DOCTYPE html>" /tmp/ci-index.html
+          grep -q "/api/state" /tmp/ci-index.html
+          echo "内嵌页面大小: $(wc -c < /tmp/ci-index.html) 字节"

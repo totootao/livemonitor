@@ -22,6 +22,7 @@ data/
 
 # 文档（README 对运行无必要，减小构建上下文）
 *.md
+docs/
 LICENSE
 
 # 测试与覆盖率产物
