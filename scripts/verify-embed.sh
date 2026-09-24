@@ -89,6 +89,23 @@ echo "[verify-embed] 临时目录: $TMPDIR_LOCAL"
 
 "$BIN" init -config "$CONFIG" || fail "init 失败"
 
+# 默认配置把监控目录写成 /audio，那是容器内的挂载点。
+# 在 CI runner 上这是根目录下的路径，普通用户无权创建，
+# 会让 NewProcessor 因 MkdirAll 失败而直接退出（症状是服务"静默"消失，
+# 且日志停在打印配置的中间）。这里改写到临时目录，聚焦校验内嵌资源本身。
+if command -v python3 >/dev/null 2>&1; then
+  python3 - "$CONFIG" "$TMPDIR_LOCAL" <<'PY'
+import json, sys
+cfg_path, tmp = sys.argv[1], sys.argv[2]
+with open(cfg_path, encoding="utf-8") as f:
+    cfg = json.load(f)
+cfg["watch_dir"] = tmp + "/audio"
+cfg["history_dir"] = tmp + "/audio/历史"
+with open(cfg_path, "w", encoding="utf-8") as f:
+    json.dump(cfg, f, ensure_ascii=False, indent=2)
+PY
+fi
+
 "$BIN" run -config "$CONFIG" -web "$ADDR" >"$SERVER_LOG" 2>&1 &
 SRV_PID=$!
 
