@@ -162,6 +162,21 @@ func (s *Store) save() error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("关闭临时配置文件失败: %w", err)
 	}
+
+	// 显式设定权限为 0644。
+	//
+	// os.CreateTemp 建的临时文件是 0600，而 os.Rename 会把这个权限原样带过去，
+	// 于是每次保存都会把配置文件的权限收窄到"仅属主可读写"。
+	// 容器默认以 root 运行、配置文件又是从宿主机挂载进去的，结果就是：
+	// 用 Web 改一次设置之后，宿主机上的普通用户再也读不了自己的 config.json
+	// （表现为 cat/ls 报 Permission denied，甚至编辑器打不开）。
+	//
+	// 配置文件里只是定时任务与目录路径，不含凭据，0644 是合适的。
+	// 权限放宽失败不作为致命错误：文件已经写好，为此让保存整个失败不值得。
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		s.log.Warn("设置配置文件权限失败（不影响本次保存）: %v", err)
+	}
+
 	if err := os.Rename(tmpName, s.path); err != nil {
 		return fmt.Errorf("替换配置文件失败: %w", err)
 	}

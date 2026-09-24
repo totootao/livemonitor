@@ -242,6 +242,52 @@ func TestParseDurationInput(t *testing.T) {
 	}
 }
 
+// TestSaveKeepsConfigWorldReadable 验证落盘的配置文件保持全局可读（0644）。
+//
+// 这是回归测试，防的是一类很隐蔽的线上问题：
+// os.CreateTemp 建出来的临时文件是 0600，而 os.Rename 会把权限原样搬到目标文件上，
+// 于是"每次保存都把配置权限收窄一次"。容器默认以 root 跑、配置又常从宿主机挂载进去，
+// 所以用 Web 改一次设置之后，宿主机的普通用户就再也读不了自己的 config.json 了。
+// 现象是 Web 提示保存成功、接口自述也是新值，唯独宿主机上 cat 报 Permission denied。
+func TestSaveKeepsConfigWorldReadable(t *testing.T) {
+	s, path := newTestStore(t, cc("a", "10:00"))
+
+	// 先真实落一次盘，制造出"已存在的配置文件"这一前提。
+	// 注意 newTestStore 只构造内存 Store，此时磁盘上还没有 config.json，
+	// 直接 chmod 会 ENOENT。
+	if _, _, err := s.UpsertContainer(cc("b", "11:00")); err != nil {
+		t.Fatal(err)
+	}
+
+	// 再把权限放宽到最能暴露问题的一档，排除 umask 之类的外部因素干扰。
+	// 只要保存逻辑还会把文件收窄成 0600，这条断言必然挂。
+	if err := os.Chmod(path, 0o666); err != nil {
+		t.Fatal(err)
+	}
+
+	// 走两条真实的保存路径：改全局设置（UpdateSettings）与改容器（UpsertContainer）。
+	if err := s.UpdateSettings(func(c *config.Config) error {
+		c.MP3Bitrate = "64k"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.UpsertContainer(cc("c", "12:00")); err != nil {
+		t.Fatal(err)
+	}
+
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0o644 {
+		t.Errorf("配置文件权限 = %04o, 期望 0644（保存不应把文件收窄为仅属主可读写）", perm)
+	}
+	if fi.Mode().Perm()&0o044 == 0 {
+		t.Errorf("配置文件权限 %04o 不含组/其他可读位，宿主机非 root 用户将无法读取", fi.Mode().Perm())
+	}
+}
+
 // TestSaveIsAtomic 验证保存通过临时文件 + rename，不产生半截文件。
 func TestSaveIsAtomic(t *testing.T) {
 	s, path := newTestStore(t)

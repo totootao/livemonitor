@@ -480,6 +480,49 @@ else
     "$(curl -s "http://127.0.0.1:18080/api/state" 2>/dev/null | grep -o '"mp3Bitrate":"[^"]*"' | head -1)"
 fi
 
+# 保存后配置文件的权限不能被收窄。
+#
+# 这是一条专门防回归的断言，对应一个很隐蔽的真实现象：
+# Go 的 os.CreateTemp 建出来的临时文件是 0600，而 os.Rename 会把权限原样搬到目标上，
+# 于是"每保存一次就把权限收窄一次"。容器默认以 root 运行、配置又从宿主机挂载进去，
+# 结果就是 Web 提示保存成功、接口自述也是新值，但宿主机上的普通用户再也读不了
+# 自己的 config.json（cat 报 Permission denied，编辑器打不开）。
+#
+# 为什么必须单独断言权限、不能只断言内容：
+#   本脚本以 root 跑，而 root 无视权限位能读任何文件。
+#   所以"内容写对了"这条断言在 root 下**永远通过**，完全看不出权限被收窄了。
+#   真正会踩坑的是以普通用户运行容器的场景（PUID/PGID），
+#   以及 CI 上启用了 user-namespace 重映射的 runner——那里 uid 1001 的 runner 用户
+#   读不了 root 拥有的 0600 文件，正是线上 CI 报"Web 改设置未写回磁盘"的根因。
+#
+# 判断标准用"其他用户可读位"（o+r）而不是精确等于 0644：
+# 只要非属主用户能读到就算合格，不把具体档位写死，避免过度约束实现。
+CFG_FILE="$WORK/config/config.json"
+if [ -f "$CFG_FILE" ]; then
+  CFG_PERM=$(stat -c '%a' "$CFG_FILE" 2>/dev/null)
+  CFG_OWNER=$(stat -c '%U:%G' "$CFG_FILE" 2>/dev/null)
+  # 0004 位即"其他用户可读"。
+  if [ -n "$CFG_PERM" ] && [ $(( 0$CFG_PERM & 04 )) -ne 0 ]; then
+    c_ok "保存后配置文件对非属主可读（权限 $CFG_PERM, $CFG_OWNER）"
+  else
+    c_bad "保存后配置文件被收窄为仅属主可读写（权限 $CFG_PERM, $CFG_OWNER）"
+    printf '      \033[2m宿主机非 root 用户将无法读取自己的配置；若是挂载目录，\033[0m\n'
+    printf '      \033[2m以 PUID/PGID 或 user-namespace 运行时会直接表现为"设置没保存"。\033[0m\n'
+    printf '      \033[2m期望权限含其他用户可读位（如 0644），实际 %s\033[0m\n' "$CFG_PERM"
+  fi
+
+  # 用真实存在的非 root 用户实际读一次，而不是只看权限位。
+  # 权限位偶尔会被 ACL 之类的机制影响，能读通才是最终标准。
+  # nobody 在 alpine 里必然存在（uid 65534），无需额外创建用户。
+  if su -s /bin/sh nobody -c "cat '$CFG_FILE' >/dev/null 2>&1"; then
+    c_ok "以 nobody 身份可读取配置文件"
+  else
+    c_bad "以 nobody 身份无法读取配置文件（权限 $CFG_PERM）"
+  fi
+else
+  c_bad "配置文件不存在，无法检查权限: $CFG_FILE"
+fi
+
 # 非法码率应被拒绝，且不能污染配置。
 BAD_SETTINGS=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
   "http://127.0.0.1:18080/api/settings" \
