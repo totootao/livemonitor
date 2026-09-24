@@ -1,25 +1,34 @@
 # syntax=docker/dockerfile:1
 
 # ---------- 构建阶段 ----------
-FROM golang:1.21-alpine AS builder
+FROM golang:1.23-alpine AS builder
 
 WORKDIR /src
 
-# 先复制依赖描述文件以充分利用层缓存（本项目零第三方依赖）。
+# 本项目零第三方依赖，go.mod 仅声明模块路径与 Go 版本。
 COPY go.mod ./
-RUN go mod download
 
+# 复制源码。测试文件已由 .dockerignore 排除。
 COPY . .
 
-# 静态编译，关闭 CGO，便于在精简运行时镜像中运行。
-RUN CGO_ENABLED=0 GOOS=linux go build \
+# 版本号由构建参数注入，供 `livemonitor version` 与镜像标签对齐。
+# 注意：必须指向 cli.Version（string 变量），const 无法被 -X 覆盖。
+ARG VERSION=dev
+ARG TARGETOS=linux
+ARG TARGETARCH
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
         -trimpath \
-        -ldflags "-s -w" \
-        -o /out/livemonitor ./cmd/livemonitor
+        -ldflags "-s -w -X github.com/totootao/livemonitor/internal/cli.Version=${VERSION}" \
+        -o /out/livemonitor ./cmd/livemonitor \
+    && /out/livemonitor version
 
 # ---------- 运行阶段 ----------
-# 需要 ffmpeg 与 docker CLI，因此基于 alpine 而非 scratch。
-FROM alpine:3.20
+# 需要 ffmpeg（转码）与 docker CLI（控制宿主机容器），因此基于 alpine 而非 scratch。
+# 使用 alpine 3.22：3.20 已停止维护，其 apk 仓库不再稳定提供 ffmpeg。
+FROM alpine:3.22
+
+ARG VERSION=dev
 
 RUN apk add --no-cache \
         ffmpeg \
@@ -27,7 +36,6 @@ RUN apk add --no-cache \
         tzdata \
         ca-certificates \
         su-exec \
-        bash \
     && rm -rf /var/cache/apk/*
 
 # 使用国内时区（可通过 TZ 环境变量覆盖）。
@@ -48,6 +56,19 @@ VOLUME ["/config"]
 
 ENV LIVEMONITOR_CONFIG=/config/config.json
 ENV LIVEMONITOR_LOG_LEVEL=info
+
+# OCI 标准标签，便于在 Docker Hub / 各类注册表中展示来源信息。
+LABEL org.opencontainers.image.title="livemonitor" \
+      org.opencontainers.image.description="直播容器监控与媒体转码服务：定时启停 Docker 容器、日志关键词触发停止、ffmpeg 转码与过期文件归档" \
+      org.opencontainers.image.source="https://github.com/totootao/livemonitor" \
+      org.opencontainers.image.url="https://github.com/totootao/livemonitor" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}"
+
+# 健康检查：配置可读且二进制可用即视为健康。
+# 使用 `version` 子命令而非 `check`，避免因用户配置错误导致容器被反复重启。
+HEALTHCHECK --interval=60s --timeout=10s --start-period=10s --retries=3 \
+    CMD livemonitor version || exit 1
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 CMD ["run"]

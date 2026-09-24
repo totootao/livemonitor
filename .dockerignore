@@ -1,0 +1,30 @@
+# 版本控制元数据（.git 约 284KB，不应进入镜像层）
+.git
+.gitignore
+.gitattributes
+
+# 构建产物
+bin/
+/livemonitor
+*.exe
+
+# 本地配置与运行时数据
+config.json
+docker-config/
+data/
+
+# CI 与编辑器配置
+.github/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 文档（README 对运行无必要，减小构建上下文）
+*.md
+LICENSE
+
+# 测试与覆盖率产物
+*_test.go
+*.out
+coverage.html

@@ -18,7 +18,16 @@ import (
 )
 
 // Version 是程序版本号。
-const Version = "1.0.0"
+//
+// 这里必须是 var 而不是 const：const 在 Go 中不可寻址，链接器的 -X 标志
+// 只能覆盖 string 类型的**变量**。若写成 const，`-X ...cli.Version=...`
+// 会静默失效（指向不存在或不可写的符号时链接器不报错），
+// 导致镜像里的版本号永远停留在默认值。
+//
+// 可通过构建参数注入：
+//
+//	go build -ldflags "-X github.com/totootao/livemonitor/internal/cli.Version=1.2.3"
+var Version = "1.0.0"
 
 const defaultConfigPath = "config.json"
 
