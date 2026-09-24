@@ -82,7 +82,7 @@ cleanup() {
   # 一并清理 7.5 节新增的临时容器，否则中途退出会留下占用固定端口的残留实例，
   # 下一次运行就会因为端口冲突而失败。
   docker rm -f "$SVC" "$TARGET" \
-    "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" >/dev/null 2>&1
+    "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" "${WATCH2:-}" >/dev/null 2>&1
   # 只删本次测试的临时目录，前缀严格匹配避免误伤。
   case "$WORK" in
     /tmp/${PREFIX}.*) rm -rf "$WORK" ;;
@@ -610,7 +610,189 @@ else
   printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$RESTART_LOG" | grep "触发定时任务" | head -5 | sed 's/^/            /')"
 fi
 
-docker rm -f "$ADOPT_SVC" "$ADOPT_TARGET" >/dev/null 2>&1
+# 核心回归二：容器被外部停掉后，状态必须以 Docker 为准。
+#
+# 程序只在 Start/Stop 被自己调用时更新"是否在运行"，容器被外部停掉时
+# 收不到通知。若直接展示内部记账，界面会一直显示"运行中"，
+# 而且点启动会被以"已在运行中"拒绝、点停止会被以"未在运行"拒绝。
+#
+# 时序设计（每一步都有原因，改动前请先读完）：
+#   1) 容器**不预先启动**，让程序自己把它拉起来——这样"程序拥有它"是确定的事实，
+#      内部记账与真实状态一致，不会误把"外部残留的容器"当成自己的。
+#   2) 计划时刻设在 23:59，调度器今天不会自动触发，启动完全由 API 显式发起，
+#      时序可控；否则可能在断言前就被调度器抢先拉起。
+#   3) 用独立实例与独立容器，避免受前面重启实验残留状态的影响。
+ADOPT_WEB_PORT=18991
+WATCH2="${ADOPT_PREFIX}-watch2"
+CFG2="$WORK/adopt2/config"
+mkdir -p "$CFG2"
+
+docker rm -f "$ADOPT_SVC" "$WATCH2" >/dev/null 2>&1
+
+# 容器先建好但不启动（模拟"配置里登记过、还没到点"的正常状态）。
+docker create --name "$WATCH2" alpine:3.22 sh -c \
+  'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 1; done' >/dev/null 2>&1
+
+cat > "$CFG2/config.json" << EOF
+{
+  "watch_dir": "$WORK/adopt2/audio",
+  "mp3_bitrate": "32k",
+  "check_interval": 3600,
+  "monitor_keywords": "等待直播",
+  "containers": [{
+    "name": "$WATCH2",
+    "start_times": "23:59",
+    "max_run_duration": 3600,
+    "keywords": "等待直播"
+  }]
+}
+EOF
+mkdir -p "$WORK/adopt2/audio"
+
+ADOPT_SVC="${ADOPT_PREFIX}-web"
+docker run -d --name "$ADOPT_SVC" -p "$ADOPT_WEB_PORT:8080" \
+  -v "$CFG2:/config" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e LIVEMONITOR_CONFIG=/config/config.json \
+  "$IMAGE" >/dev/null 2>&1
+
+# 等 Web 就绪。
+web_ready=0
+for _ in $(seq 1 30); do
+  if curl -sf "http://127.0.0.1:$ADOPT_WEB_PORT/api/state" >/dev/null 2>&1; then
+    web_ready=1; break
+  fi
+  sleep 1
+done
+
+if [ "$web_ready" != "1" ]; then
+  c_bad "7.5 节 Web 实例未就绪，跳过外部停止验证"
+else
+  # 通过 API 显式启动。容器此刻是停着的，所以 Start 会真正下发 start，
+  # 内部记账与 Docker 真实状态就此一致——这正是本用例需要的前置。
+  START_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+    "http://127.0.0.1:$ADOPT_WEB_PORT/api/containers/$WATCH2/start" 2>/dev/null)
+
+  # 等程序确实接管（日志监控挂上），并且容器真的跑起来了。
+  #
+  # 注意这里的判据是"开始监控新日志"，不是"接管监控"：
+  # 容器此刻是停的，程序会走真正的 start 分支（日志里是"启动容器..."→"启动成功"），
+  # 只有"发现容器已经在跑、直接接管"那条分支才会打印"接管监控"。
+  # 用错判据会把这个用例误判成前置失败——它其实已经成功了。
+  owned=0
+  for _ in $(seq 1 40); do
+    if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "开始监控新日志" \
+       && [ "$(docker inspect -f '{{.State.Running}}' "$WATCH2" 2>/dev/null || echo false)" = "true" ]; then
+      owned=1; break
+    fi
+    sleep 1
+  done
+
+  if [ "$owned" != "1" ]; then
+    c_bad "前置失败：程序未启动/接管目标容器，无法验证外部停止（start 返回 HTTP $START_CODE）"
+    printf '      \033[2m日志: %s\033[0m\n' "$(docker logs "$ADOPT_SVC" 2>&1 | tail -8 | sed 's/^/            /')"
+  else
+    # ---- 核心回归三：热重载不得重放任务，也不得误停正在运行的容器 ----
+    #
+    # 必须放在"外部停止"之前：一旦容器被外部停掉，它本来就该是未运行状态，
+    # 再断言"重载后仍在运行"就成了一条永远失败的用例——测的是自己刚做的操作。
+    #
+    # 这是生产环境里"同一批容器被反复启动"的另一个触发路径：
+    # Reload 会 RemoveByPrefix + Add 重建所有 scheduledJob 对象，
+    # 若"今天是否已执行"只挂在 job 对象上，重建就等于清零，任务会再跑一遍。
+    # 这里必须走真实的 /api/reload，而不是重启进程——重启那一条上面已经验过了。
+    #
+    # 断言的是"重载前后容器启动次数不增加"，而不是"从状态文件恢复了记录"。
+    # 原因：这个容器是刚才由 API 显式启动的，并没有经过调度器，
+    # 因此根本不会有调度状态记录可恢复（落盘只发生在任务真正触发时）。
+    # 拿一个不会发生的现象当断言，只会得到一个永远失败的用例。
+    starts_before=$(docker logs "$ADOPT_SVC" 2>&1 | grep -c "启动容器" || true)
+    RELOAD_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+      "http://127.0.0.1:$ADOPT_WEB_PORT/api/reload" 2>/dev/null)
+    sleep 3
+    RELOAD_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
+    starts_after=$(printf '%s' "$RELOAD_LOG" | grep -c "启动容器" || true)
+
+    if [ "$RELOAD_CODE" != "200" ]; then
+      c_bad "配置热重载接口返回 HTTP $RELOAD_CODE，期望 200"
+    else
+      c_ok "配置热重载接口可用（HTTP 200）"
+    fi
+
+    # 关键断言：重载不应导致任务被重新触发。
+    # 计划时刻是 23:59，今天不该有任何调度触发；重载后依然不该有。
+    triggers=$(printf '%s' "$RELOAD_LOG" | grep -c "触发定时任务" || true)
+    if [ "${triggers:-0}" -eq 0 ]; then
+      c_ok "热重载未触发任何计划任务"
+    else
+      c_bad "热重载触发了 $triggers 次计划任务（期望 0）"
+      printf '      \033[2m日志: %s\033[0m\n' \
+        "$(printf '%s' "$RELOAD_LOG" | grep "触发定时任务" | head -3 | sed 's/^/            /')"
+    fi
+
+    if [ "${starts_after:-0}" -gt "${starts_before:-0}" ]; then
+      c_bad "热重载后容器被重复启动（重载前 $starts_before 次，重载后 $starts_after 次）"
+      printf '      \033[2m日志: %s\033[0m\n' \
+        "$(printf '%s' "$RELOAD_LOG" | grep "启动容器" | head -5 | sed 's/^/            /')"
+    else
+      c_ok "热重载未重复启动容器（重载前后均为 $starts_before 次）"
+    fi
+
+    # 重载会重建监控器并重挂定时任务，但不应把已在运行的容器停掉。
+    if [ "$(docker inspect -f '{{.State.Running}}' "$WATCH2" 2>/dev/null || echo false)" = "true" ]; then
+      c_ok "热重载后目标容器仍在运行（未被误停）"
+    else
+      c_bad "热重载把正在运行的目标容器停掉了"
+    fi
+
+    # ---- 核心回归二：容器被外部停掉后，状态必须以 Docker 为准 ----
+    #
+    # 程序只在 Start/Stop 被自己调用时更新"是否在运行"，容器被外部停掉时
+    # 收不到通知。若直接展示内部记账，界面会一直显示"运行中"，
+    # 而且点启动会被以"已在运行中"拒绝、点停止会被以"未在运行"拒绝。
+    #
+    # 此刻程序认为容器在运行（记账与真实状态一致）。从外部把它停掉——
+    # 程序收不到任何通知，内部记账会停留在"运行中"。
+    docker stop "$WATCH2" >/dev/null 2>&1
+    # 给状态接口一个同步的机会；即使立刻查询也应该已经纠正，
+    # 这里留 2s 只是避免把"容器刚停、Docker 状态尚在收敛"误判成缺陷。
+    sleep 2
+
+    # 状态接口必须报告 running=false。这是本用例的核心断言：
+    # 若只读内部记账（修复前的行为），这里会错误地返回 true。
+    STATE_JSON=$(curl -sf "http://127.0.0.1:$ADOPT_WEB_PORT/api/state" 2>/dev/null || echo '{}')
+    target_running=$(printf '%s' "$STATE_JSON" | python3 -c "
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    print('parse-error'); raise SystemExit
+for c in d.get('containers',[]):
+    if c.get('name')=='$WATCH2':
+        print(str(c.get('running')).lower()); break
+else:
+    print('not-found')
+" 2>/dev/null)
+
+    if [ "$target_running" = "false" ]; then
+      c_ok "外部停止的容器在状态接口中被正确报告为未运行"
+    else
+      c_bad "外部停止的容器仍被报告为运行中（running=$target_running）"
+    fi
+
+    # 顺带验证：停止一个实际已经停止的容器，应被明确拒绝（HTTP 400），
+    # 而不是因为陈旧的内部记账而"假装成功"。
+    STOP_CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+      "http://127.0.0.1:$ADOPT_WEB_PORT/api/containers/$WATCH2/stop" 2>/dev/null)
+    if [ "$STOP_CODE" = "400" ]; then
+      c_ok "停止已停止的容器被明确拒绝（HTTP 400，说明读的是真实状态）"
+    else
+      c_bad "停止已停止的容器返回 HTTP $STOP_CODE，期望 400"
+    fi
+  fi
+fi
+
+docker rm -f "$ADOPT_SVC" "$WATCH2" >/dev/null 2>&1
 
 # ---------- 8. 优雅退出 ----------
 

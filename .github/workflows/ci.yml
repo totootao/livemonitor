@@ -88,7 +88,11 @@ jobs:
         run: |
           echo "----- 容器列表 -----"
           docker ps -a || true
-          for c in lmci-svc lmci-target lmci-adopt-svc lmci-adopt-target; do
+          # 7.5 节现在用两套独立实例：adopt-svc/target（接管+重启不重放）
+          # 与 adopt-web/watch2（外部停止 + 热重载）。
+          for c in lmci-svc lmci-target \
+                   lmci-adopt-svc lmci-adopt-target \
+                   lmci-adopt-web lmci-adopt-watch2; do
             echo "----- $c 日志 -----"
             docker logs "$c" 2>&1 | tail -60 || true
           done
