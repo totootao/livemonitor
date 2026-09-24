@@ -9,6 +9,9 @@ services:
     environment:
       TZ: Asia/Shanghai
       LIVEMONITOR_LOG_LEVEL: info
+      # Docker Engine API 的 socket 路径。镜像里已设同样的默认值，
+      # 这里显式写出是为了让"用哪个 socket"一目了然；改用自定义路径时只需改这两处。
+      DOCKER_HOST: "unix:///var/run/docker.sock"
       # Web 管理界面监听地址；设为 off 可完全禁用。
       LIVEMONITOR_WEB_ADDR: ":8080"
       # 如需以指定用户运行（处理挂载目录属主），取消下面两行注释。

@@ -5,8 +5,8 @@
 
 功能与原脚本一致：
 
-1. **定时启动容器** — 每个容器可配置多个每日启动时刻，到点自动 `docker start`。
-2. **日志关键词监控** — `docker logs -f` 实时跟踪，命中关键词（默认 `等待直播`）立即 `docker stop`。
+1. **定时启动容器** — 每个容器可配置多个每日启动时刻，到点自动启动容器。
+2. **日志关键词监控** — 实时跟踪容器日志，命中关键词（默认 `等待直播`）立即停止容器。
 3. **最大运行时长保护** — 到达设定时长后自动停止容器。
 4. **媒体转码** — 监控目录中的视频/音频文件用 ffmpeg 转为 MP3（单声道 / 22050Hz）。
 5. **过期文件归档** — 早于阈值的 MP3 自动移入 `历史` 子目录。
@@ -19,6 +19,7 @@
 | `schedule.every().day.at()` | `internal/scheduler` | 按秒轮询，按「日期 + 时刻」去重，避免同一时刻重复触发 |
 | `mutagen.mp3.MP3().info.bitrate` | `internal/media/mp3.go` | 自行解析 MPEG 帧头，跳过 ID3v2 标签，含二次帧校验防误判 |
 | `subprocess.run/Popen` | `internal/dockerctl`、`internal/media` | 全部改为 `context` 驱动，支持超时与优雅取消 |
+| `subprocess.run(["docker", ...])` | `internal/dockerctl` + Docker Engine API | 直接用标准库经 unix socket 调 Engine API，镜像内不再需要 docker CLI（省约 31MB） |
 | `threading.Thread` + `Event` | goroutine + `context.Context` | 用 context 取消替代 Event 信号，避免竞态 |
 | `re.compile(r'[\x00-\x1F\x7F]')` | `monitor.CleanLogLine` | 逐 rune 扫描，保留制表符 |
 | `shutil.move` | `media.moveFile` | 先 `rename`，跨分区时回退为复制 + 删除 |
@@ -136,6 +137,11 @@ docker compose up -d
 ```
 
 **必须挂载 `/var/run/docker.sock`**，否则无法控制宿主机容器（媒体转码仍可工作）。
+程序通过 Docker Engine API 直接与 socket 通信（HTTP over unix socket），**镜像内不安装
+docker CLI**，因此体积比走命令行的方案小约 31MB。
+
+> 挂载 socket 等同于把宿主机 Docker 的控制权交给容器，请勿把 Web 管理界面直接暴露到公网。
+> 若确实需要更严格的隔离，可改用只读 socket 或 docker-socket-proxy 转发。
 
 环境变量：
 
@@ -144,6 +150,7 @@ docker compose up -d
 | `LIVEMONITOR_CONFIG` | `/config/config.json` | 配置文件路径 |
 | `LIVEMONITOR_LOG_LEVEL` | `info` | 日志级别 |
 | `LIVEMONITOR_WEB_ADDR` | `:8080` | Web 界面监听地址，设为 `off` 禁用 |
+| `DOCKER_HOST` | `unix:///var/run/docker.sock` | Docker Engine API 的 socket 路径（仅支持 unix://） |
 | `TZ` | `Asia/Shanghai` | 时区（影响所有定时任务的判定） |
 | `PUID` / `PGID` | 未设置 | 同时设置则以该 UID/GID 运行，便于处理挂载目录属主 |
 
@@ -154,11 +161,23 @@ make test              # 全部单元测试
 make test-race         # 竞态检测
 ```
 
-测试不依赖网络与真实 docker：
-`internal/monitor` 使用假的 Runner 与可控日志流驱动关键词匹配；
-`internal/media` 在 ffmpeg 可用时生成真实音频文件验证码率解析与转码产物；
-`internal/runtime` 验证配置热更新的原子落盘与并发安全；
-`internal/web` 通过假控制器覆盖全部 HTTP 接口（含错误路径与路径穿越防护）。
+测试不依赖网络：
+
+- `internal/dockerctl` 用临时 unix socket 起一个假的 Engine API 服务，覆盖探活、启停、
+  日志帧解析与请求路径转义；
+- `internal/monitor` 使用假的客户端与可控日志流驱动关键词匹配；
+- `internal/media` 在 ffmpeg 可用时生成真实音频文件验证码率解析与转码产物；
+- `internal/runtime` 验证配置热更新的原子落盘与并发安全；
+- `internal/web` 通过假控制器覆盖全部 HTTP 接口（含错误路径与路径穿越防护）。
+
+想对真实 Docker 跑一遍集成测试（需要本机可用的 docker socket）：
+
+```bash
+docker run -d --name livemonitor-selftest alpine:3.22 \
+  sh -c 'while true; do echo "测试日志 $(date)"; sleep 2; done'
+LIVEMONITOR_DOCKER_E2E=1 go test -run TestLive -v ./internal/dockerctl/
+docker rm -f livemonitor-selftest
+```
 
 ## 项目结构
 
@@ -167,7 +186,7 @@ cmd/livemonitor/          程序入口
 internal/cli/             子命令与参数解析
 internal/config/          配置定义、加载、校验
 internal/logging/         带作用域前缀的并发安全日志
-internal/dockerctl/       docker CLI 封装（同步 + 流式）
+internal/dockerctl/       Docker Engine API 客户端（unix socket + HTTP，无 CLI 依赖）
 internal/scheduler/       每日定点调度（支持按 ID 精确增删）
 internal/monitor/         容器生命周期监控
 internal/media/           MP3 解析、ffmpeg 转码、目录扫描与归档

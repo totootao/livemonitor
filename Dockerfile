@@ -24,15 +24,17 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     && /out/livemonitor version
 
 # ---------- 运行阶段 ----------
-# 需要 ffmpeg（转码）与 docker CLI（控制宿主机容器），因此基于 alpine 而非 scratch。
+# 需要 ffmpeg（转码），因此基于 alpine 而非 scratch。
 # 使用 alpine 3.22：3.20 已停止维护，其 apk 仓库不再稳定提供 ffmpeg。
 FROM alpine:3.22
 
 ARG VERSION=dev
 
+# 注意：这里刻意不安装 docker-cli。
+# 程序通过 Docker Engine API（unix socket + HTTP）直接控制容器，
+# 不再调用 docker 命令，因此可以省下约 31MB 的 CLI 体积。
 RUN apk add --no-cache \
         ffmpeg \
-        docker-cli \
         tzdata \
         ca-certificates \
         su-exec \
@@ -58,6 +60,9 @@ ENV LIVEMONITOR_CONFIG=/config/config.json
 ENV LIVEMONITOR_LOG_LEVEL=info
 # Web 管理界面监听地址；设为 off 可禁用。
 ENV LIVEMONITOR_WEB_ADDR=:8080
+# Docker Engine API 的 socket 路径。程序用它控制宿主机容器，
+# 需要在运行时把宿主机的 /var/run/docker.sock 挂载进来（见 docker-compose.yml）。
+ENV DOCKER_HOST=unix:///var/run/docker.sock
 
 # Web 管理界面端口。需在 docker run -p / compose ports 中映射到宿主机。
 EXPOSE 8080

@@ -182,9 +182,10 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 
 	m.video.Start(ctx)
 
-	// 启动前检查依赖，缺失只告警不阻塞（原脚本同样允许 ffmpeg/docker 缺失）。
-	if err := m.docker.BinaryAvailable(); err != nil {
-		m.log.Warn("docker 依赖检查未通过: %v，容器控制将不可用", err)
+	// 启动前探测 Docker Engine 是否可达，不可达只告警不阻塞
+	//（原脚本同样允许 docker 缺失，此时媒体转码仍可工作）。
+	if err := m.docker.Available(ctx); err != nil {
+		m.log.Warn("Docker Engine 不可达: %v，容器控制将不可用", err)
 	}
 
 	// 启动 Web 管理界面。

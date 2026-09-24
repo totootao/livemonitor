@@ -1,14 +1,32 @@
-// Package dockerctl 封装对 docker CLI 的调用。
+// Package dockerctl 通过 Docker Engine API 控制宿主机上的容器。
+//
+// 实现方式：直接对 /var/run/docker.sock 发 HTTP 请求，不依赖 docker CLI。
+// 好处是容器镜像里不必再装 docker-cli（约 31MB），且行为更可控——
+// 不必解析命令行输出，也不受 CLI 版本差异影响。
+//
+// 仅依赖标准库。涉及的 Engine API 端点：
+//
+//	GET  /_ping                                  探活
+//	GET  /containers/{id}/json                   查询状态
+//	POST /containers/{id}/start                  启动
+//	POST /containers/{id}/stop                   停止
+//	POST /containers/{id}/exec                   创建 exec 实例
+//	POST /exec/{id}/start                        运行 exec 实例
+//	GET  /containers/{id}/logs?follow=1&tail=0   流式日志
 package dockerctl
 
 import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
+	"net"
+	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,176 +37,381 @@ import (
 // ErrNotRunning 表示容器当前不处于运行状态。
 var ErrNotRunning = errors.New("容器未在运行")
 
-// Runner 抽象命令执行，便于测试时注入假实现。
-type Runner interface {
-	// Run 同步执行命令并返回标准输出 + 标准错误。
-	Run(ctx context.Context, name string, args ...string) (stdout string, stderr string, err error)
-	// Stream 流式执行命令，逐行回调输出（stdout 与 stderr 合并）。
-	Stream(ctx context.Context, name string, args ...string) (StreamHandle, error)
-}
+// 默认 Docker socket 路径。可通过 DOCKER_HOST 覆盖（仅支持 unix:// 形式）。
+const defaultSocket = "/var/run/docker.sock"
 
-// StreamHandle 表示一个正在运行的流式子进程。
+// StreamHandle 表示一个正在运行的日志流。
 type StreamHandle interface {
-	// Lines 返回日志行通道，进程退出或上下文取消后通道关闭。
+	// Lines 返回日志行通道，流结束或上下文取消后通道关闭。
 	Lines() <-chan string
-	// Wait 等待进程退出并返回其错误（若被取消则为 context 错误或 nil）。
+	// Wait 等待流结束并返回其错误。
 	Wait() error
-	// Kill 强制结束子进程。
+	// Kill 强制中断流。
 	Kill() error
 }
 
-// Client 是面向 docker 的客户端。
+// Client 是面向 Docker Engine API 的客户端。
 type Client struct {
-	run    Runner
-	binary string
+	http   *http.Client
 	log    *logging.Logger
+	socket string
 }
 
-// New 创建 docker 客户端，使用系统 PATH 中的 docker 可执行文件。
+// New 创建客户端，使用默认 Docker socket。
 func New(log *logging.Logger) *Client {
-	return &Client{run: &execRunner{}, binary: "docker", log: log}
+	return NewWithSocket(resolveSocket(), log)
 }
 
-// NewWithRunner 用自定义 Runner 创建客户端，主要用于测试。
-func NewWithRunner(r Runner, binary string, log *logging.Logger) *Client {
-	return &Client{run: r, binary: binary, log: log}
+// NewWithSocket 用指定 socket 路径创建客户端，主要用于测试。
+func NewWithSocket(socket string, log *logging.Logger) *Client {
+	dialer := &net.Dialer{}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", socket)
+		},
+		// 容器操作可能持续较久（stop 默认等 10s 优雅退出），不设全局超时，
+		// 由调用方通过 context 控制。
+		DisableCompression: true,
+	}
+	return &Client{
+		http:   &http.Client{Transport: transport},
+		log:    log,
+		socket: socket,
+	}
 }
 
-// BinaryAvailable 检查 docker 命令是否可用。
-func (c *Client) BinaryAvailable() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// resolveSocket 解析 DOCKER_HOST 环境变量，得到要连接的 unix socket 路径。
+// 非 unix:// 形式（如 tcp://）不支持，退回默认路径。
+func resolveSocket() string {
+	host := strings.TrimSpace(envOr("DOCKER_HOST", ""))
+	if host == "" {
+		return defaultSocket
+	}
+	const prefix = "unix://"
+	if strings.HasPrefix(host, prefix) {
+		p := strings.TrimPrefix(host, prefix)
+		if p != "" {
+			return p
+		}
+	}
+	return defaultSocket
+}
+
+// Available 检查 Engine API 是否可达。
+func (c *Client) Available(ctx context.Context) error {
+	rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if _, _, err := c.run.Run(ctx, c.binary, "version", "--format", "{{.Server.Version}}"); err != nil {
-		return fmt.Errorf("docker 不可用: %w", err)
+	body, status, err := c.do(rctx, http.MethodGet, "/_ping", nil)
+	if err != nil {
+		return fmt.Errorf("docker 不可达（socket %s）: %w", c.socket, err)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("docker 探活失败: HTTP %d %s", status, strings.TrimSpace(string(body)))
 	}
 	return nil
 }
 
 // InspectRunning 判断容器是否处于 running 状态。
 func (c *Client) InspectRunning(ctx context.Context, container string) (bool, error) {
-	out, _, err := c.run.Run(ctx, c.binary, "inspect", "-f", "{{.State.Running}}", container)
+	body, status, err := c.do(ctx, http.MethodGet, "/containers/"+url.PathEscape(container)+"/json", nil)
 	if err != nil {
 		return false, err
 	}
-	return strings.TrimSpace(out) == "true", nil
+	if status == http.StatusNotFound {
+		return false, fmt.Errorf("容器 %s 不存在", container)
+	}
+	if status != http.StatusOK {
+		return false, fmt.Errorf("查询容器 %s 状态失败: HTTP %d %s", container, status, truncate(body))
+	}
+	var info struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	if err := json.Unmarshal(body, &info); err != nil {
+		return false, fmt.Errorf("解析容器 %s 状态失败: %w", container, err)
+	}
+	return info.State.Running, nil
 }
 
 // Start 启动容器。
 func (c *Client) Start(ctx context.Context, container string) error {
-	if _, stderr, err := c.run.Run(ctx, c.binary, "start", container); err != nil {
-		return fmt.Errorf("docker start %s 失败: %w (%s)", container, err, strings.TrimSpace(stderr))
+	body, status, err := c.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(container)+"/start", nil)
+	if err != nil {
+		return fmt.Errorf("启动容器 %s 失败: %w", container, err)
 	}
-	return nil
+	// 304 表示容器已在运行，按幂等语义视为成功。
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		return nil
+	}
+	return fmt.Errorf("启动容器 %s 失败: HTTP %d %s", container, status, apiMessage(body))
 }
 
-// Stop 停止容器，带超时时间（秒）。
+// Stop 停止容器。使用 Engine 默认的超时（10 秒优雅退出）。
 func (c *Client) Stop(ctx context.Context, container string) error {
-	if _, stderr, err := c.run.Run(ctx, c.binary, "stop", container); err != nil {
-		return fmt.Errorf("docker stop %s 失败: %w (%s)", container, err, strings.TrimSpace(stderr))
+	body, status, err := c.do(ctx, http.MethodPost, "/containers/"+url.PathEscape(container)+"/stop", nil)
+	if err != nil {
+		return fmt.Errorf("停止容器 %s 失败: %w", container, err)
 	}
-	return nil
+	// 304 表示容器已停止，视为成功。
+	if status == http.StatusNoContent || status == http.StatusNotModified {
+		return nil
+	}
+	return fmt.Errorf("停止容器 %s 失败: HTTP %d %s", container, status, apiMessage(body))
 }
 
 // TruncateInternalLogs 尝试清空容器内部 /var/log/*log。失败不算致命。
 func (c *Client) TruncateInternalLogs(ctx context.Context, container string) error {
-	_, stderr, err := c.run.Run(ctx, c.binary, "exec", container, "sh", "-c", "truncate -s 0 /var/log/*log 2>/dev/null || true")
+	execID, err := c.createExec(ctx, container, []string{
+		"sh", "-c", "truncate -s 0 /var/log/*log 2>/dev/null || true",
+	})
 	if err != nil {
-		return fmt.Errorf("容器内清空日志失败: %w (%s)", err, strings.TrimSpace(stderr))
+		return err
+	}
+	if err := c.startExec(ctx, execID); err != nil {
+		return fmt.Errorf("容器内清空日志失败: %w", err)
 	}
 	return nil
 }
 
-// RotateLogs 借助 `docker logs --tail 0` 触发 json-file 日志驱动的轮转读取。
-// 说明：外部进程无法直接清空 docker 的 json 日志文件，这里用读取尾部 0 行做无损探活，
+// RotateLogs 借助读取日志尾部 0 行做无损探活。
+// 说明：外部进程无法直接清空 docker 的 json 日志文件，这里只做一次读取确认容器仍在，
 // 真正的日志回收依赖 docker 的 log-opts(max-size/max-file) 配置。
 func (c *Client) RotateLogs(ctx context.Context, container string) error {
-	_, stderr, err := c.run.Run(ctx, c.binary, "logs", "--tail", "0", container)
+	path := "/containers/" + url.PathEscape(container) +
+		"/logs?stdout=1&stderr=1&tail=0"
+	body, status, err := c.do(ctx, http.MethodGet, path, nil)
 	if err != nil {
-		return fmt.Errorf("docker logs 清理失败: %w (%s)", err, strings.TrimSpace(stderr))
+		return fmt.Errorf("读取容器 %s 日志失败: %w", container, err)
+	}
+	if status != http.StatusOK {
+		return fmt.Errorf("读取容器 %s 日志失败: HTTP %d %s", container, status, truncate(body))
 	}
 	return nil
 }
 
 // LogsFollow 以流式方式跟踪容器日志。
-// since 为 nil 时使用 --tail=0 只跟踪新产生的日志。
+// since 为 nil 时使用 tail=0 只跟踪新产生的日志。
 func (c *Client) LogsFollow(ctx context.Context, container string, since *time.Time) (StreamHandle, error) {
-	args := []string{"logs", "-f", "--tail=0"}
+	q := url.Values{}
+	q.Set("stdout", "1")
+	q.Set("stderr", "1")
+	q.Set("follow", "1")
 	if since != nil {
-		args = append(args, "--since", since.Format(time.RFC3339))
+		q.Set("since", strconv.FormatInt(since.Unix(), 10))
 	}
-	args = append(args, container)
-	c.log.Debug("执行: %s %s", c.binary, strings.Join(args, " "))
-	return c.run.Stream(ctx, c.binary, args...)
-}
+	q.Set("tail", "0")
+	path := "/containers/" + url.PathEscape(container) + "/logs?" + q.Encode()
+	c.log.Debug("跟踪容器日志: %s", path)
 
-// ---- 默认 Runner 实现 ----
-
-type execRunner struct{}
-
-func (e *execRunner) Run(ctx context.Context, name string, args ...string) (string, string, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	err := cmd.Run()
-	return stdout.String(), stderr.String(), err
-}
-
-type execStream struct {
-	lines chan string
-	cmd   *exec.Cmd
-	pipe  io.ReadCloser
-	once  sync.Once
-}
-
-func (e *execRunner) Stream(ctx context.Context, name string, args ...string) (StreamHandle, error) {
-	cmd := exec.CommandContext(ctx, name, args...)
-	pipe, err := cmd.StdoutPipe()
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
 	if err != nil {
 		return nil, err
 	}
-	cmd.Stderr = cmd.Stdout // 合并 stderr 到同一管道，与原脚本行为一致
-	if err := cmd.Start(); err != nil {
-		return nil, err
+	// 日志流是无限长度的，必须用流式响应，不能等 body 读完。
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("跟踪容器 %s 日志失败: %w", container, err)
 	}
-	st := &execStream{lines: make(chan string, 256), cmd: cmd, pipe: pipe}
-	go st.pump()
-	return st, nil
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("跟踪容器 %s 日志失败: HTTP %d %s",
+			container, resp.StatusCode, apiMessage(body))
+	}
+
+	stream := &httpStream{
+		lines:  make(chan string, 256),
+		body:   resp.Body,
+		cancel: ctx,
+	}
+	go stream.pump()
+	return stream, nil
 }
 
-func (s *execStream) pump() {
-	defer close(s.lines)
-	scanner := bufio.NewScanner(s.pipe)
-	// 直播弹幕日志单行可能很长，放宽缓冲区上限到 1MB。
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		s.lines <- scanner.Text()
+// ---- 内部实现 ----
+
+// do 发起一次请求并读完全部响应体。
+func (c *Client) do(ctx context.Context, method, path string, body []byte) ([]byte, int, error) {
+	req, err := c.newRequest(ctx, method, path, body)
+	if err != nil {
+		return nil, 0, err
 	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, resp.StatusCode, err
+	}
+	return data, resp.StatusCode, nil
+}
+
+func (c *Client) newRequest(ctx context.Context, method, path string, body []byte) (*http.Request, error) {
+	var rdr io.Reader
+	if body != nil {
+		rdr = bytes.NewReader(body)
+	}
+	// 走 unix socket 时 host 无意义，但必须是非空值。
+	req, err := http.NewRequestWithContext(ctx, method, "http://docker"+path, rdr)
+	if err != nil {
+		return nil, err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	return req, nil
+}
+
+// createExec 创建 exec 实例并返回其 ID。
+func (c *Client) createExec(ctx context.Context, container string, cmd []string) (string, error) {
+	payload, err := json.Marshal(map[string]any{
+		"AttachStdout": true,
+		"AttachStderr": true,
+		"Cmd":          cmd,
+	})
+	if err != nil {
+		return "", err
+	}
+	body, status, err := c.do(ctx, http.MethodPost,
+		"/containers/"+url.PathEscape(container)+"/exec", payload)
+	if err != nil {
+		return "", fmt.Errorf("在容器 %s 中创建 exec 失败: %w", container, err)
+	}
+	if status != http.StatusCreated {
+		return "", fmt.Errorf("在容器 %s 中创建 exec 失败: HTTP %d %s",
+			container, status, apiMessage(body))
+	}
+	var out struct {
+		ID string `json:"Id"`
+	}
+	if err := json.Unmarshal(body, &out); err != nil {
+		return "", fmt.Errorf("解析 exec 响应失败: %w", err)
+	}
+	if out.ID == "" {
+		return "", errors.New("exec 响应缺少 Id 字段")
+	}
+	return out.ID, nil
+}
+
+// startExec 运行 exec 实例并等待结束。
+func (c *Client) startExec(ctx context.Context, execID string) error {
+	payload, err := json.Marshal(map[string]any{"Detach": true, "Tty": false})
+	if err != nil {
+		return err
+	}
+	body, status, err := c.do(ctx, http.MethodPost,
+		"/exec/"+url.PathEscape(execID)+"/start", payload)
+	if err != nil {
+		return err
+	}
+	if status != http.StatusOK && status != http.StatusNoContent {
+		return fmt.Errorf("HTTP %d %s", status, apiMessage(body))
+	}
+	return nil
+}
+
+// httpStream 把 Engine 日志流的响应体按行推送到通道。
+type httpStream struct {
+	lines  chan string
+	body   io.ReadCloser
+	cancel context.Context
+	once   sync.Once
+	err    error
+}
+
+func (s *httpStream) pump() {
+	defer close(s.lines)
+	defer s.body.Close()
+
+	reader := bufio.NewReaderSize(s.body, 64*1024)
+	for {
+		select {
+		case <-s.cancel.Done():
+			return
+		default:
+		}
+
+		// 日志流（非 TTY）采用 8 字节帧头：1 字节流类型 + 3 字节填充 + 4 字节大端长度。
+		// 必须按帧读取，否则帧头字节会混进日志内容里变成乱码。
+		frame, err := readLogFrame(reader)
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.once.Do(func() { s.err = err })
+			}
+			return
+		}
+
+		// 一帧可能包含多行，逐行投递。
+		for _, line := range strings.Split(strings.TrimRight(string(frame), "\n"), "\n") {
+			select {
+			case s.lines <- line:
+			case <-s.cancel.Done():
+				return
+			}
+		}
+	}
+}
+
+// readLogFrame 读取一个日志帧的内容。
+func readLogFrame(r *bufio.Reader) ([]byte, error) {
+	var header [8]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return nil, err
+	}
+	size := int(header[4])<<24 | int(header[5])<<16 | int(header[6])<<8 | int(header[7])
+	if size <= 0 {
+		return []byte{}, nil
+	}
+	// 单帧异常大时限制读取量，避免被恶意/损坏的流拖垮内存。
+	const maxFrame = 4 << 20
+	if size > maxFrame {
+		size = maxFrame
+	}
+	buf := make([]byte, size)
+	if _, err := io.ReadFull(r, buf); err != nil {
+		return nil, err
+	}
+	return buf, nil
 }
 
 // Lines 返回日志行通道。
-func (s *execStream) Lines() <-chan string { return s.lines }
+func (s *httpStream) Lines() <-chan string { return s.lines }
 
-// Wait 等待子进程退出。
-func (s *execStream) Wait() error {
-	err := s.cmd.Wait()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			// 被 SIGTERM/上下文取消导致的退出属预期行为。
-			return nil
-		}
+// Wait 等待流结束。流因上下文取消而结束属预期行为，返回 nil。
+func (s *httpStream) Wait() error {
+	if s.cancel.Err() != nil {
+		return nil
 	}
-	return err
+	return s.err
 }
 
-// Kill 终止子进程。
-func (s *execStream) Kill() error {
-	var err error
-	s.once.Do(func() {
-		if s.cmd.Process != nil {
-			err = s.cmd.Process.Kill()
-		}
-	})
-	return err
+// Kill 强制中断流。
+func (s *httpStream) Kill() error {
+	return s.body.Close()
+}
+
+// apiMessage 从 Engine 的错误响应中提取可读消息。
+func apiMessage(body []byte) string {
+	var out struct {
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(body, &out); err == nil && out.Message != "" {
+		return out.Message
+	}
+	return truncate(body)
+}
+
+func truncate(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 300 {
+		return s[:300] + "..."
+	}
+	return s
+}
+
+func envOr(key, fallback string) string {
+	return lookupEnv(key, fallback)
 }
