@@ -119,7 +119,16 @@ IMG_SIZE=$(docker image inspect "$IMAGE" --format '{{.Size}}')
 c_ok "镜像存在，大小 $((IMG_SIZE / 1024 / 1024)) MB"
 
 mkdir -p "$WORK/audio" "$WORK/config"
-chmod 777 "$WORK/audio"   # 容器内可能以非 root 运行
+# 整个工作目录都要放开权限，不能只放开 audio。
+#
+# mktemp -d 建出来的是 0700（只有创建者可进入）。容器里虽然默认是 root，
+# 但只要启用了 user-namespace 重映射（GitHub 的 ubuntu-latest runner 就是），
+# 或者用 PUID/PGID 以普通用户运行，就会被这个 0700 挡住：
+# 表现是配置根本无法回写，报
+#   open /config/.config-XXXX.tmp: permission denied
+# 而"Web 改设置未写回磁盘"这条断言首当其冲。
+# 之前只 chmod 了 audio，config 目录一直是漏的。
+chmod -R 777 "$WORK"
 
 # ---------- 1. 镜像内容 ----------
 
@@ -433,15 +442,32 @@ fi
 
 # 修改设置应写回磁盘（配置持久化是 Web 界面的关键承诺）。
 # 注意接口用 PUT（POST 会返回 405），且字段名是 camelCase 的 mp3Bitrate。
-SETTINGS_RESP=$(curl -sf -X PUT "http://127.0.0.1:18080/api/settings" \
+#
+# 这里刻意不用 `curl -sf`：-f 会让 HTTP 错误码直接判定为失败并**丢弃响应体**，
+# 一旦接口行为异常，日志里只剩一句"未写回磁盘"，看不到真实原因。
+# 改成显式取状态码与响应体，失败时一并打印，便于定位。
+SETTINGS_CODE=$(curl -s -o /tmp/e2e-settings.json -w '%{http_code}' -X PUT \
+  "http://127.0.0.1:18080/api/settings" \
   -H 'Content-Type: application/json' \
-  -d '{"mp3Bitrate":"64k"}' 2>&1)
-sleep 2
-if grep -q '"mp3_bitrate": "64k"\|"mp3_bitrate":"64k"' "$WORK/config/config.json" 2>/dev/null; then
+  -d '{"mp3Bitrate":"64k"}' 2>/dev/null)
+SETTINGS_RESP=$(cat /tmp/e2e-settings.json 2>/dev/null)
+
+# 等待写盘生效。CI runner 负载高时 2s 可能不够，这里轮询到最多 10s，
+# 且一旦命中就立刻跳出，正常路径不会变慢。
+settings_ok=0
+for _ in $(seq 1 10); do
+  if grep -q '"mp3_bitrate": *"64k"' "$WORK/config/config.json" 2>/dev/null; then
+    settings_ok=1; break
+  fi
+  sleep 1
+done
+if [ "$settings_ok" = "1" ]; then
   c_ok "Web 改设置已写回 config.json"
 else
-  c_bad "Web 改设置未写回磁盘"
+  c_bad "Web 改设置未写回磁盘（PUT 返回 HTTP $SETTINGS_CODE）"
   printf '      \033[2m响应: %s\033[0m\n' "$(printf '%s' "$SETTINGS_RESP" | head -3)"
+  printf '      \033[2m配置中的 mp3_bitrate: %s\033[0m\n' \
+    "$(grep -o '"mp3_bitrate": *"[^"]*"' "$WORK/config/config.json" 2>/dev/null | head -1)"
 fi
 
 # 非法码率应被拒绝，且不能污染配置。
@@ -489,6 +515,8 @@ section "7.5 接管已运行容器与重启不重放"
 ADOPT_PREFIX="${PREFIX}-adopt"
 ADOPT_CFG="$WORK/adopt/config"
 mkdir -p "$ADOPT_CFG"
+# 在 chmod -R 之后才创建，需单独放开：容器要往这里回写调度状态文件。
+chmod 777 "$ADOPT_CFG"
 
 # 目标容器先手动起起来（模拟"用户自己起的 / 上次残留的"），再启动服务。
 ADOPT_TARGET="${ADOPT_PREFIX}-target"
@@ -662,6 +690,7 @@ ADOPT_WEB_PORT=18991
 WATCH2="${ADOPT_PREFIX}-watch2"
 CFG2="$WORK/adopt2/config"
 mkdir -p "$CFG2"
+chmod 777 "$CFG2"
 
 docker rm -f "$ADOPT_SVC" "$WATCH2" >/dev/null 2>&1
 
