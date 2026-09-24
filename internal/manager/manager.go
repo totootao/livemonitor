@@ -188,9 +188,16 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 	}
 
 	// 启动 Web 管理界面。
+	// 注意：Web 地址是用户在命令行/环境变量里显式给出的，说明管理界面是预期功能。
+	// 此时监听失败（例如端口被占用）不能只记一条日志就继续跑——进程看起来"正常运行"，
+	// 实际管理界面完全不可用，用户无从察觉。所以这里直接报错并返回非零退出码。
 	if webAddr != "" && webAddr != "off" {
 		if err := m.startWeb(webAddr); err != nil {
-			m.log.Error("Web 管理界面启动失败: %v", err)
+			m.log.Error("%v", err)
+			cancel()
+			// shutdown 内部已包含视频处理器与容器的停止逻辑。
+			m.shutdown()
+			return 1
 		}
 	} else {
 		m.log.Info("Web 管理界面已禁用")
