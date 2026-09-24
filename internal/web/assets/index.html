@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="light dark">
 <title>livemonitor 定时任务管理</title>
 <style>
@@ -134,6 +134,12 @@
   tbody tr:hover { background: color-mix(in srgb, var(--accent-soft) 35%, transparent); }
   td.actions { white-space: nowrap; display: flex; gap: 6px; flex-wrap: wrap; }
 
+  /* 表格容器允许横向滚动：6 列表格总宽约 900px，桌面窄窗口（分屏、半屏）
+     下若被 card 的 overflow:hidden 裁掉就再也看不到了。
+     移动端媒体查询里会把它改回 visible（那时表格已卡片化，不需要滚动）。 */
+  .card-body.table-wrap { padding: 0; overflow-x: auto; }
+  #filter { width: 200px; }
+
   .tag {
     display: inline-flex; align-items: center; gap: 4px;
     padding: 2px 8px; border-radius: 999px; font-size: 12px;
@@ -191,6 +197,89 @@
   .dot-idle { background: var(--muted); }
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ---------- 移动端适配（≤720px） ----------
+     手机上用这个界面多半是"顺手停个容器 / 看一眼状态"，所以重点不是
+     把桌面布局缩起来，而是把高频操作做到拇指可达：
+     表格摊成卡片、按钮加大到舒适触控、弹窗全屏、输入框 16px 防 iOS 缩放。
+     列名由 JS 渲染时写在 td 的 data-label 上，这里用 td::before 展示。 */
+  @media (max-width: 720px) {
+    main { padding: 12px; gap: 14px; }
+
+    /* 顶栏：副标题与次要统计（时区）收起，压缩内边距 */
+    header.topbar { padding: 10px 12px; }
+    .topbar-inner { gap: 8px; }
+    .brand small { display: none; }
+    .stat-inline { gap: 10px; }
+    .stat-inline .stat-tz { display: none; }
+
+    .card-head { padding: 12px 14px; }
+    .card-head .hint { display: none; }  /* 静态提示文案在窄屏是噪音 */
+    .card-body { padding: 14px; }
+    #filter { flex: 1 1 120px; width: auto; min-width: 0; }
+
+    /* iOS Safari 在输入框字号 < 16px 时，聚焦会强制缩放页面；
+       16px 是唯一能稳住视口的值。按钮随之加大，顺带满足触控目标。 */
+    input, select { font-size: 16px; }
+    button, .btn { font-size: 15px; padding: 9px 14px; }
+    button.tiny { font-size: 13px; padding: 8px 12px; }
+
+    /* ---- 表格卡片化 ---- */
+    .table-wrap { overflow-x: visible; }
+    .table-wrap table, .table-wrap tbody { display: block; }
+    .table-wrap thead { display: none; }
+    .table-wrap tbody tr {
+      display: block;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--border);
+    }
+    .table-wrap tbody tr:last-child { border-bottom: none; }
+    .table-wrap tbody tr:hover { background: transparent; }
+    .table-wrap td {
+      display: flex; align-items: baseline; justify-content: space-between;
+      gap: 12px; padding: 4px 0; border-bottom: none; white-space: normal;
+    }
+    .table-wrap td::before {
+      content: attr(data-label);
+      color: var(--muted); font-size: 12px; flex: 0 0 auto;
+    }
+    /* 容器名是卡片标题，占整行，不带列名 */
+    .table-wrap td.cell-name {
+      flex-direction: column; align-items: stretch; gap: 2px;
+      padding-bottom: 8px;
+    }
+    .table-wrap td.cell-name::before { content: none; }
+    /* 值居右，与左侧列名形成两栏结构 */
+    .table-wrap td .kv, .table-wrap td.cell-dur { text-align: right; }
+    .table-wrap td .times { justify-content: flex-end; }
+    .table-wrap td .kv .v { word-break: break-all; }
+    /* 操作按钮 2×2 等宽网格，拇指可点 */
+    .table-wrap td.actions {
+      display: grid; grid-template-columns: 1fr 1fr; gap: 8px;
+      padding-top: 10px; white-space: normal;
+    }
+    .table-wrap td.actions::before {
+      content: "操作"; grid-column: 1 / -1; text-align: left;
+    }
+    .table-wrap td.actions .tiny { padding: 9px 10px; font-size: 14px; text-align: center; }
+
+    /* 弹窗全屏：居中浮窗会被软键盘挤压到看不清。
+       必须限定 [open]——UA 用 display:none 隐藏未打开的 dialog，
+       作者样式 dialog{display:flex} 的优先级足以把它盖掉，
+       结果就是一个看不见入口、却占满一屏的白块糊在页面上。 */
+    dialog[open] {
+      display: flex; flex-direction: column;
+      width: 100vw; max-width: 100vw;
+      height: 100vh; max-height: 100vh;      /* 不支持 dvh 的兜底 */
+      height: 100dvh; max-height: 100dvh;    /* 随地址栏/键盘动态伸缩 */
+      border-radius: 0; border: none;
+    }
+    .dialog-body { flex: 1; overflow-y: auto; min-height: 0; }
+    .dialog-foot { padding-bottom: max(14px, env(safe-area-inset-bottom)); }
+
+    /* toast 铺满底部，长消息不再截断 */
+    #toasts { left: 12px; right: 12px; bottom: max(12px, env(safe-area-inset-bottom)); }
+  }
 </style>
 </head>
 <body>
@@ -223,10 +312,10 @@
       <h2>容器定时任务</h2>
       <span class="hint" id="containerCount"></span>
       <div class="spacer"></div>
-      <input id="filter" placeholder="按名称过滤…" style="width:200px" autocomplete="off">
+      <input id="filter" placeholder="按名称过滤…" autocomplete="off">
       <button class="primary" id="btnAdd">新增容器</button>
     </div>
-    <div class="card-body" style="padding:0">
+    <div class="card-body table-wrap">
       <table>
         <thead>
           <tr>
@@ -402,7 +491,8 @@ function render() {
     el("span", {}, [el("b", { text: String(state.containers.length) }), " 个容器"]),
     el("span", {}, [el("b", { text: String(state.jobsTotal) }), " 个定时任务"]),
     el("span", {}, [el("b", { text: String(running) }), " 个运行中"]),
-    el("span", { text: "时区 " + state.timezone }),
+    // stat-tz 在移动端被隐藏（窄屏上属次要信息，不值得占一整行）。
+    el("span", { class: "stat-tz", text: "时区 " + state.timezone }),
   );
 
   // 概览
@@ -481,7 +571,7 @@ function renderContainers() {
       next = el("span", { class: "tag", text: "—" });
     }
 
-    const actions = el("td", { class: "actions" }, [
+    const actions = el("td", { class: "actions", "data-label": "操作" }, [
       el("button", {
         class: "tiny primary", text: "立即启动", disabled: isBusy || c.running,
         title: "跳过定时计划，立刻启动该容器",
@@ -503,7 +593,7 @@ function renderContainers() {
     ]);
 
     // 最长运行时长 + 剩余时间提示
-    const durCell = el("td", {}, [
+    const durCell = el("td", { class: "cell-dur", "data-label": "最长运行" }, [
       el("div", { class: "mono", text: fmtDuration(c.maxRunDuration) }),
       c.running
         ? el("div", { class: "k", style: "color:var(--muted);font-size:12px",
@@ -511,8 +601,10 @@ function renderContainers() {
         : null,
     ]);
 
-    // 关键词提示（专属/继承全局）
-    const nameCell = el("td", {}, [
+    // 关键词提示（专属/继承全局）。
+    // td 上的 data-label 供移动端卡片化布局的列名使用（td::before 展示）；
+    // cell-name 是卡片标题行，不显示列名。
+    const nameCell = el("td", { class: "cell-name" }, [
       el("div", { class: "mono", style: "font-weight:600", text: c.name }),
       c.keywords && c.keywords.length
         ? el("div", { style: "color:var(--muted);font-size:12px", text: "关键词: " + c.keywords.join(" / ") })
@@ -521,10 +613,10 @@ function renderContainers() {
 
     tbody.appendChild(el("tr", {}, [
       nameCell,
-      el("td", {}, [times]),
+      el("td", { "data-label": "每日启动" }, [times]),
       durCell,
-      el("td", {}, [status]),
-      el("td", {}, [next]),
+      el("td", { "data-label": "状态" }, [status]),
+      el("td", { "data-label": "下次启动" }, [next]),
       actions,
     ]));
   }

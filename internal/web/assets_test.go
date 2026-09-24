@@ -85,3 +85,26 @@ func TestIndexSurvivesFormatting(t *testing.T) {
 		t.Fatalf("内嵌页面 %d 字节，超出合理范围", len(indexHTML))
 	}
 }
+
+// TestIndexHasMobileLayout 回归防护：移动端适配不能被悄悄删掉。
+//
+// 页面在手机上主要靠两件事成立：
+//  1. ≤720px 的媒体查询把表格摊成卡片、加大触控目标；
+//  2. JS 渲染行时把列名写在 td 的 data-label 上，供 td::before 展示。
+//     若 JS 改动后丢了 data-label，卡片里就只剩值没有字段名，等于不可用。
+func TestIndexHasMobileLayout(t *testing.T) {
+	page := string(indexHTML)
+	for _, want := range []string{
+		"@media (max-width: 720px)", // 移动端断点
+		"viewport-fit=cover",        // 安全区（iPhone 刘海/底部横条）
+		`content: attr(data-label)`, // 卡片化布局的列名来源
+		`"data-label": "每日启动"`,      // JS 侧必须实际写入列名
+		`"data-label": "操作"`,
+		"cell-name",       // 卡片标题行（不带列名的特判）
+		"font-size: 16px", // 防 iOS 聚焦缩放
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("页面缺少移动端适配要素 %q", want)
+		}
+	}
+}
