@@ -5,8 +5,14 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /src
 
-# 本项目零第三方依赖，go.mod 仅声明模块路径与 Go 版本。
-COPY go.mod ./
+# 本项目仅依赖两个纯 Go 库（MP3 编解码），go.mod 里没有 cgo 依赖。
+# GOPROXY 可在构建时覆盖：国内网络下 proxy.golang.org 常常不可达，
+# 可传入 --build-arg GOPROXY=https://goproxy.cn,direct。
+# 先声明再置空，避免默认值在 COPY 之前被缓存成旧层的环境变量。
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+COPY go.mod go.sum ./
+RUN go mod download
 
 # 复制源码。测试文件已由 .dockerignore 排除。
 COPY . .
@@ -24,17 +30,18 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     && /out/livemonitor version
 
 # ---------- 运行阶段 ----------
-# 需要 ffmpeg（转码），因此基于 alpine 而非 scratch。
-# 使用 alpine 3.22：3.20 已停止维护，其 apk 仓库不再稳定提供 ffmpeg。
+# 音频转码已改为纯 Go 实现（go-mp3 解码 + shine-mp3 编码），
+# 不再需要 ffmpeg，因此运行阶段可以是极简的 alpine。
 FROM alpine:3.22
 
 ARG VERSION=dev
 
-# 注意：这里刻意不安装 docker-cli。
-# 程序通过 Docker Engine API（unix socket + HTTP）直接控制容器，
-# 不再调用 docker 命令，因此可以省下约 31MB 的 CLI 体积。
+# 刻意只装最小依赖：
+#   tzdata           定时任务依赖正确的时区数据
+#   ca-certificates  HTTPS 证书（Docker Engine API 走 unix socket，但用户可能配置 TLS）
+#   su-exec          以指定 UID/GID 运行，处理挂载目录属主
+# 不装 ffmpeg：转码由纯 Go 代码完成，整套 ffmpeg 的共享库约 130MB。
 RUN apk add --no-cache \
-        ffmpeg \
         tzdata \
         ca-certificates \
         su-exec \
@@ -69,7 +76,7 @@ EXPOSE 8080
 
 # OCI 标准标签，便于在 Docker Hub / 各类注册表中展示来源信息。
 LABEL org.opencontainers.image.title="livemonitor" \
-      org.opencontainers.image.description="直播容器监控与媒体转码服务：定时启停 Docker 容器、日志关键词触发停止、ffmpeg 转码与过期文件归档" \
+      org.opencontainers.image.description="直播容器监控与媒体压缩服务：定时启停 Docker 容器、日志关键词触发停止、纯 Go MP3 压缩与过期文件归档" \
       org.opencontainers.image.source="https://github.com/totootao/livemonitor" \
       org.opencontainers.image.url="https://github.com/totootao/livemonitor" \
       org.opencontainers.image.licenses="MIT" \

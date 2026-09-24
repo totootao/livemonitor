@@ -40,7 +40,7 @@ type Config struct {
 	StableDelay int `json:"stable_delay"`
 	// ArchiveAfterHours 是归档阈值（小时），早于该时长的 MP3 会被移入归档目录。
 	ArchiveAfterHours int `json:"archive_after_hours"`
-	// MP3Bitrate 是 ffmpeg 输出比特率。
+	// MP3Bitrate 是压缩输出的目标比特率。
 	MP3Bitrate string `json:"mp3_bitrate"`
 	// MonitorKeywords 是触发停止容器的日志关键词。
 	MonitorKeywords StringList `json:"monitor_keywords"`

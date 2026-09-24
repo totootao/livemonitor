@@ -20,9 +20,6 @@ jobs:
           go-version: '1.23'
           cache: true
 
-      - name: 安装 ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y ffmpeg
-
       - name: 检查格式
         run: |
           unformatted=$(gofmt -l .)

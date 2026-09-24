@@ -1,4 +1,4 @@
-// Package media 提供媒体文件处理能力：MP3 码率解析、ffmpeg 转码、目录扫描与归档。
+// Package media 提供媒体文件处理能力：MP3 码率解析、纯 Go 重编码、目录扫描与归档。
 package media
 
 import (
@@ -85,16 +85,21 @@ func ProbeMP3(path string) (MP3Info, error) {
 			if !ok {
 				continue
 			}
-			// 用第二帧位置做一次一致性校验，避免误命中 id3 数据里的伪同步字。
+			// 二次校验：确认后面不远处确实还有一帧，避免误命中 ID3 正文
+			// 或音频数据里偶然出现的伪同步字。
+			//
+			// 注意不能只查 frameLength() 那一个位置：定长 CBR 之外还有两类
+			// 常见情况——VBR 文件（帧长浮动），以及 Shine 这类"按内容实际长度
+			// 写帧、不补齐到帧长"的编码器。因此在理论位置附近开一个窗口搜索，
+			// 只要能在窗口内找到下一帧就认可。
 			if info.VBR {
 				return info, nil
 			}
 			next := i + frameLength(info)
-			if next+4 <= len(window) {
-				if _, ok2 := parseFrameHeader(window[next : next+4]); ok2 {
-					return info, nil
-				}
-			} else {
+			if hasFrameHeaderNear(window, next) {
+				return info, nil
+			}
+			if next+frameSearchWindow > len(window) {
 				// 缓冲区不够做二次校验，直接返回首帧结果。
 				return info, nil
 			}
@@ -108,6 +113,44 @@ func ProbeMP3(path string) (MP3Info, error) {
 		}
 	}
 	return MP3Info{}, ErrNoMP3Frame
+}
+
+// frameSearchWindow 是二次帧校验时在理论位置附近搜索的字节范围。
+// 取一帧长度量级即可覆盖 VBR 与"不补齐帧长"这两类编码器的浮动。
+const frameSearchWindow = 2048
+
+// hasFrameHeaderNear 检查 [pos-window, pos+window] 内是否存在另一帧的同步字。
+//
+// 这个宽松度是必要的：帧长并非总是严格等于理论值，但伪同步字的出现是
+// 稀疏的，因此只要附近还有一帧就足以排除误判。
+func hasFrameHeaderNear(window []byte, pos int) bool {
+	lo := pos - frameSearchWindow
+	if lo < 0 {
+		lo = 0
+	}
+	hi := pos + frameSearchWindow
+	if hi > len(window)-4 {
+		hi = len(window) - 4
+	}
+	for i := lo; i <= hi; i++ {
+		if i < 0 || i+4 > len(window) {
+			continue
+		}
+		if window[i] != 0xFF || window[i+1]&0xE0 != 0xE0 {
+			continue
+		}
+		if i == pos {
+			// 理论位置命中，直接认可。
+			if _, ok := parseFrameHeader(window[i : i+4]); ok {
+				return true
+			}
+			continue
+		}
+		if _, ok := parseFrameHeader(window[i : i+4]); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // id3v2Size 返回文件开头 ID3v2 标签的总长度（含 header 与 footer）。

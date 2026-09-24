@@ -17,11 +17,20 @@ import (
 )
 
 // VideoExtensions 是被识别为媒体的扩展名集合。
-// 前 11 项与原脚本完全一致；后 3 项是常见的直播录音格式，便于直接接入。
+//
+// 只保留 MP3：转码改为纯 Go 实现后，解码端只支持 MP3，
+// 其他格式没有可用的纯 Go 解码器（见 transcoder.go 的说明）。
+// 扫描到曾经的视频/音频扩展名时会给出告警日志，提示需要先转成 MP3。
 var VideoExtensions = map[string]bool{
+	".mp3": true,
+}
+
+// unsupportedMediaExtensions 是"看起来像媒体但我们处理不了"的扩展名。
+// 命中时打一条告警，避免用户把 .ts 丢进来后困惑于"为什么一直没动静"。
+var unsupportedMediaExtensions = map[string]bool{
 	".mp4": true, ".avi": true, ".mov": true, ".flv": true, ".mkv": true,
-	".wmv": true, ".mpeg": true, ".mpg": true, ".ts": true, ".m4a": true, ".mp3": true,
-	".aac": true, ".opus": true, ".wav": true,
+	".wmv": true, ".mpeg": true, ".mpg": true, ".ts": true, ".m4a": true,
+	".aac": true, ".opus": true, ".wav": true, ".flac": true, ".ogg": true,
 }
 
 // HistoryDirName 是归档子目录名。
@@ -94,6 +103,10 @@ type Processor struct {
 	// 转码失败重试控制：路径 -> 上次失败时间。
 	failMu    sync.Mutex
 	failTimes map[string]time.Time
+
+	// 不受支持格式的告警去重：路径 -> 已告警。
+	warnMu            sync.Mutex
+	warnedUnsupported map[string]bool
 
 	// 已处理记录：路径 -> 处理完成时该文件的 (大小, 修改时间)。
 	// 这是防止"转码产物被反复重新编码"的关键：
@@ -189,6 +202,7 @@ func NewProcessor(opt Options) (*Processor, error) {
 		done:              make(chan struct{}),
 		failTimes:         make(map[string]time.Time),
 		doneSet:           make(map[string]fileStamp),
+		warnedUnsupported: make(map[string]bool),
 	}, nil
 }
 
@@ -349,8 +363,14 @@ func (p *Processor) enqueueCandidates() {
 
 		name := d.Name()
 		lower := strings.ToLower(name)
+		ext := filepath.Ext(lower)
 
 		if !hasMediaExt(lower) {
+			// 曾经支持、现在处理不了的格式：告警一次，免得用户以为程序卡住了。
+			// 用 Debug 之外的级别是有意的——这是需要用户采取行动的情况。
+			if unsupportedMediaExtensions[ext] {
+				p.warnUnsupported(path, ext)
+			}
 			return nil
 		}
 		// 中间产物由转码流程内部处理，不重复入队。
@@ -399,7 +419,24 @@ func hasMediaExt(lower string) bool {
 	return VideoExtensions[ext]
 }
 
-// workerLoop 串行消费转码队列，避免多个 ffmpeg 争抢 CPU。
+// warnUnsupported 对不受支持的媒体格式打一条告警。
+//
+// 按文件路径去重：扫描是周期性的，不去重会把日志刷爆。
+// 用路径而非扩展名做键，是为了让每个文件各自提醒一次。
+func (p *Processor) warnUnsupported(path, ext string) {
+	p.warnMu.Lock()
+	if p.warnedUnsupported[path] {
+		p.warnMu.Unlock()
+		return
+	}
+	p.warnedUnsupported[path] = true
+	p.warnMu.Unlock()
+
+	p.log.Warn("跳过不支持的格式 %s（%s）：纯 Go 转码只处理 MP3，请先将其转为 MP3",
+		path, ext)
+}
+
+// workerLoop 串行消费转码队列，避免多个文件同时编码争抢 CPU。
 func (p *Processor) workerLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
