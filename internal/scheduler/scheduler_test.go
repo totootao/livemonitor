@@ -18,8 +18,11 @@ func TestFiresAtScheduledTime(t *testing.T) {
 	var mu sync.Mutex
 	var runs []time.Time
 
-	// 计划时刻设为当前时间的 1 秒前，构造"已到点"的初始状态。
-	past := time.Now().Add(-time.Second)
+	// 计划时刻设为今天零点，构造"已到点"的初始状态。
+	// 不能用 time.Now().Add(-time.Second)：午夜后 1 秒内运行测试时，
+	// 该时刻的时钟部分拼回"今天"会变成 23:59:59 尚未到点，断言随挂钟翻车。
+	// 当天 00:00:00 永远不晚于 now，是唯一全天稳定的"已过点"构造。
+	past := todayAt(0, 0, 0)
 	s.Add(Job{
 		Name: "job-a",
 		At:   past,
@@ -47,10 +50,18 @@ func TestFiresAtScheduledTime(t *testing.T) {
 // TestDoesNotFireBeforeTime 验证未到点的任务不会提前触发。
 func TestDoesNotFireBeforeTime(t *testing.T) {
 	s := New(logging.New("test"))
+
+	// At 的语义是"每日 HH:MM"（只取时钟部分）。若用 time.Now().Add(2h) 构造
+	// 未来任务，在 22:00 后运行测试会跨到次日，时钟部分落回当天凌晨，
+	// 被判定为"已过点"而立即触发——测试随挂钟时间翻车。
+	// 注入固定时间源（调度器为单测预留的入口），断言完全确定。
+	base := time.Date(2026, 3, 1, 10, 0, 0, 0, time.Local)
+	s.SetNowFunc(func() time.Time { return base })
+
 	fired := make(chan struct{}, 1)
 	s.Add(Job{
 		Name: "future",
-		At:   time.Now().Add(2 * time.Hour),
+		At:   base.Add(2 * time.Hour), // 当天 12:00，尚未到点
 		Fn:   func() { fired <- struct{}{} },
 	})
 
@@ -126,7 +137,7 @@ func TestNextRunReturnsEarliest(t *testing.T) {
 func TestPanicInJobDoesNotCrashScheduler(t *testing.T) {
 	s := New(logging.New("test"))
 	done := make(chan struct{})
-	s.Add(Job{Name: "panicky", At: time.Now().Add(-time.Second), Fn: func() {
+	s.Add(Job{Name: "panicky", At: todayAt(0, 0, 0), Fn: func() {
 		defer close(done)
 		panic("boom")
 	}})
@@ -166,7 +177,7 @@ func TestStatePersistsAcrossRestart(t *testing.T) {
 	// ---- 第一个进程 ----
 	s1 := New(logging.New("test"))
 	s1.SetStatePath(statePath)
-	s1.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s1.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 
 	if !s1.RunOnce() {
 		t.Fatal("首个进程应触发已到点的任务")
@@ -181,7 +192,7 @@ func TestStatePersistsAcrossRestart(t *testing.T) {
 
 	var mu sync.Mutex
 	fired := 0
-	s2.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {
+	s2.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {
 		mu.Lock()
 		fired++
 		mu.Unlock()
@@ -209,14 +220,14 @@ func TestStatePersistsAcrossRestart(t *testing.T) {
 // 这正是日志里同一个容器名出现两次的原因。
 func TestStateSurvivesJobRebuild(t *testing.T) {
 	s := New(logging.New("test"))
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	if !s.RunOnce() {
 		t.Fatal("首次应触发")
 	}
 
 	// 模拟 installContainer：先移除，再以同样的 ID 重新添加。
 	s.RemoveByPrefix("c1")
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 
 	if s.RunOnce() {
 		t.Error("任务重建后不应重放当天已执行的任务")
@@ -226,11 +237,11 @@ func TestStateSurvivesJobRebuild(t *testing.T) {
 // TestStateSurvivesReloadWithoutRemove 覆盖只 Add 不 Remove 的幂等路径。
 func TestStateSurvivesReloadWithoutRemove(t *testing.T) {
 	s := New(logging.New("test"))
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	if !s.RunOnce() {
 		t.Fatal("首次应触发")
 	}
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	if s.RunOnce() {
 		t.Error("重复 Add 同一任务不应导致重放")
 	}
@@ -251,7 +262,7 @@ func TestLoadStateDropsYesterdayEntries(t *testing.T) {
 	s.SetStatePath(statePath)
 
 	var fired int
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() { fired++ }})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() { fired++ }})
 	if !s.RunOnce() {
 		t.Error("昨天的触发记录不应阻止今天执行")
 	}
@@ -281,7 +292,7 @@ func TestLoadStateHandlesCorruptFile(t *testing.T) {
 func TestLoadStateMissingFileIsFine(t *testing.T) {
 	s := New(logging.New("test"))
 	s.SetStatePath(filepath.Join(t.TempDir(), "does-not-exist.json"))
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 
 	if !s.RunOnce() {
 		t.Error("首次启动应正常触发任务")
@@ -295,7 +306,7 @@ func TestSaveStateIsAtomic(t *testing.T) {
 
 	s := New(logging.New("test"))
 	s.SetStatePath(statePath)
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	s.RunOnce()
 
 	if _, err := os.Stat(statePath + ".tmp"); !os.IsNotExist(err) {
@@ -318,7 +329,7 @@ func TestSaveStateCreatesMissingDir(t *testing.T) {
 
 	s := New(logging.New("test"))
 	s.SetStatePath(statePath)
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	s.RunOnce()
 
 	if _, err := os.Stat(statePath); err != nil {
@@ -329,7 +340,7 @@ func TestSaveStateCreatesMissingDir(t *testing.T) {
 // TestNoStatePathStillWorks 未配置落盘路径时，行为应与旧版一致（内存记录）。
 func TestNoStatePathStillWorks(t *testing.T) {
 	s := New(logging.New("test"))
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	if !s.RunOnce() {
 		t.Error("未配置状态文件时仍应正常触发")
 	}
@@ -341,7 +352,7 @@ func TestNoStatePathStillWorks(t *testing.T) {
 // TestClearRunRecord 清除记录后当天可以再触发一次（供 Web "立即执行" 使用）。
 func TestClearRunRecord(t *testing.T) {
 	s := New(logging.New("test"))
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	if !s.RunOnce() {
 		t.Fatal("首次应触发")
 	}
@@ -361,7 +372,7 @@ func TestClearRunRecordPersists(t *testing.T) {
 
 	s := New(logging.New("test"))
 	s.SetStatePath(statePath)
-	s.Add(Job{ID: "c1", Name: "c1", At: time.Now().Add(-time.Second), Fn: func() {}})
+	s.Add(Job{ID: "c1", Name: "c1", At: todayAt(0, 0, 0), Fn: func() {}})
 	s.RunOnce()
 	s.ClearRunRecord("c1")
 
@@ -397,6 +408,14 @@ func TestSnapshotReflectsRestoredState(t *testing.T) {
 		}
 	}
 	t.Error("未找到任务 c1 的快照")
+}
+
+// todayAt 返回今天 h:m:s 的时刻。
+// 用于构造"已过点"的任务时刻：当天 00:00:00 永远不晚于运行中的 now，
+// 相比 time.Now().Add(-x) 不会在午夜边界产生"时钟部分落回前一天"的歧义。
+func todayAt(h, m, sec int) time.Time {
+	now := time.Now()
+	return time.Date(now.Year(), now.Month(), now.Day(), h, m, sec, 0, now.Location())
 }
 
 func stringsContains(haystack, needle string) bool {
