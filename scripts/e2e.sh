@@ -497,7 +497,39 @@ docker run -d --name "$ADOPT_TARGET" alpine:3.22 sh -c \
   'i=0; while true; do i=$((i+1)); echo "tick $i"; sleep 1; done' >/dev/null 2>&1
 
 # 计划时刻设为已过点（用当前时间减 1 分钟），让任务在服务启动后立即到点。
-PAST_HHMM=$(date -d '1 minute ago' '+%H:%M')
+#
+# 必须按**容器时区**算，不能用宿主机时区。
+# 镜像里固定了 TZ=Asia/Shanghai，而 CI runner（ubuntu-latest）是 UTC，
+# 两边差 8 小时：宿主机生成的 "08:50" 在容器看来是 8 小时后的未来，
+# 任务永远不到点，本节的 6 条断言会集体失败。
+# 本地开发机若恰好也是东八区则看不出问题——这正是它长期潜伏的原因。
+#
+# 实现上有个坑：镜像里是 BusyBox 的 date，不认 GNU 的 `-d "1 minute ago"`，
+# 所以只能从容器取"当前时刻"，再由宿主机做减法。
+# 宿主机比容器慢 1 分钟以内时，"当前时刻减一分钟"必然已过点，够用了。
+CONTAINER_TZ="${LIVEMONITOR_TZ:-Asia/Shanghai}"
+CONTAINER_HHMM=$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c 'date "+%H:%M"' 2>/dev/null)
+if [ -z "$CONTAINER_HHMM" ]; then
+  echo "  提示: 无法从容器取时间，改用 TZ=$CONTAINER_TZ 计算"
+  CONTAINER_HHMM=$(TZ="$CONTAINER_TZ" date '+%H:%M')
+fi
+# 容器时区下的"今天"，用于比对状态文件里容器写下的日期。
+TODAY_IN_CONTAINER=$(TZ="$CONTAINER_TZ" date '+%Y-%m-%d')
+
+# 由 HH:MM 减一分钟（纯算术，避开 date -d 的 GNU 依赖）。
+CONTAINER_H=${CONTAINER_HHMM%%:*}
+CONTAINER_M=${CONTAINER_HHMM##*:}
+# 去掉可能的时区后缀，并强制按十进制解析（避免 "08" 被当八进制）。
+CONTAINER_H=$((10#$CONTAINER_H))
+CONTAINER_M=$((10#$CONTAINER_M))
+if [ "$CONTAINER_M" -eq 0 ]; then
+  CONTAINER_M=59
+  CONTAINER_H=$(( (CONTAINER_H + 23) % 24 ))
+else
+  CONTAINER_M=$((CONTAINER_M - 1))
+fi
+PAST_HHMM=$(printf '%02d:%02d' "$CONTAINER_H" "$CONTAINER_M")
+echo "  容器时区 $CONTAINER_TZ 当前 $CONTAINER_HHMM，计划时刻取 $PAST_HHMM（已过点）"
 cat > "$ADOPT_CFG/config.json" << EOF
 {
   "watch_dir": "$WORK/adopt/audio",
@@ -568,8 +600,12 @@ else
 fi
 
 # 状态文件应落到配置文件旁边，且记下当天已执行。
+#
+# "今天"同样要按容器时区取。状态文件是容器写下的（它按 Asia/Shanghai 记日期），
+# 用宿主机日期去比对在 CI（UTC）上会差一天——尤其在 UTC 16:00 之后，
+# 宿主机已经跨天而容器还没有，断言就会失败。
 STATE_FILE="$ADOPT_CFG/scheduler-state.json"
-today="$(date '+%Y-%m-%d')"
+today="${TODAY_IN_CONTAINER:-$(date '+%Y-%m-%d')}"
 state_ok=0
 for _ in $(seq 1 10); do
   if [ -f "$STATE_FILE" ] && contains "$(cat "$STATE_FILE" 2>/dev/null)" "$today"; then

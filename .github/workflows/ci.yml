@@ -115,3 +115,19 @@ jobs:
             ${{ runner.temp }}/e2e-docker.log
           if-no-files-found: warn
           retention-days: 7
+
+      # 把失败断言直接打进 workflow annotation。
+      # artifact 与 job 日志在受限网络下都会 302 到 blob 存储域而被代理拦掉，
+      # 唯独 annotation 走 check-run 的 output 字段，经 API 可读——
+      # 这是唯一能在那种网络下拿到失败原因的通道。
+      - name: 输出失败断言摘要
+        if: failure()
+        run: |
+          echo "::group::失败断言"
+          grep -n "✘" "${RUNNER_TEMP}/e2e.log" | head -20 | while IFS= read -r line; do
+            echo "::error::${line}"
+          done
+          echo "::endgroup::"
+          echo "::group::统计"
+          tail -5 "${RUNNER_TEMP}/e2e.log"
+          echo "::endgroup::"
