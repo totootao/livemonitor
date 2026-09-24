@@ -81,20 +81,37 @@ jobs:
         env:
           IMAGE: livemonitor:ci
           PREFIX: lmci
-        run: bash scripts/e2e.sh
+        run: |
+          set -o pipefail
+          bash scripts/e2e.sh 2>&1 | tee "${RUNNER_TEMP}/e2e.log"
 
       - name: 失败时导出服务日志
         if: failure()
         run: |
-          echo "----- 容器列表 -----"
-          docker ps -a || true
-          # 7.5 节现在用两套独立实例：adopt-svc/target（接管+重启不重放）
-          # 与 adopt-web/watch2（外部停止 + 热重载）。
-          for c in lmci-svc lmci-target \
-                   lmci-adopt-svc lmci-adopt-target \
-                   lmci-adopt-web lmci-adopt-watch2; do
-            echo "----- $c 日志 -----"
-            docker logs "$c" 2>&1 | tail -60 || true
-          done
-          echo "----- 调度状态文件 -----"
-          cat "${RUNNER_TEMP:-/tmp}"/lmci.*/adopt/config/scheduler-state.json 2>/dev/null || true
+          {
+            echo "----- 容器列表 -----"
+            docker ps -a || true
+            # 7.5 节现在用两套独立实例：adopt-svc/target（接管+重启不重放）
+            # 与 adopt-web/watch2（外部停止 + 热重载）。
+            for c in lmci-svc lmci-target \
+                     lmci-adopt-svc lmci-adopt-target \
+                     lmci-adopt-web lmci-adopt-watch2; do
+              echo "----- $c 日志 -----"
+              docker logs "$c" 2>&1 | tail -60 || true
+            done
+            echo "----- 调度状态文件 -----"
+            cat "${RUNNER_TEMP:-/tmp}"/lmci.*/adopt/config/scheduler-state.json 2>/dev/null || true
+          } | tee "${RUNNER_TEMP}/e2e-docker.log"
+
+      # 失败时把完整输出上传成 artifact。job 日志在部分受限网络下无法下载
+      # （会 302 到 blob 存储域），artifact 走的是另一套接口，通常可达。
+      - name: 上传失败诊断日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-failure-logs
+          path: |
+            ${{ runner.temp }}/e2e.log
+            ${{ runner.temp }}/e2e-docker.log
+          if-no-files-found: warn
+          retention-days: 7
