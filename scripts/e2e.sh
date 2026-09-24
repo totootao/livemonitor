@@ -511,13 +511,39 @@ if [ -f "$CFG_FILE" ]; then
     printf '      \033[2m期望权限含其他用户可读位（如 0644），实际 %s\033[0m\n' "$CFG_PERM"
   fi
 
-  # 用真实存在的非 root 用户实际读一次，而不是只看权限位。
-  # 权限位偶尔会被 ACL 之类的机制影响，能读通才是最终标准。
-  # nobody 在 alpine 里必然存在（uid 65534），无需额外创建用户。
-  if su -s /bin/sh nobody -c "cat '$CFG_FILE' >/dev/null 2>&1"; then
+  # 再用一个非 root 用户实际读一次，而不是只看权限位。
+  # 权限位可能被 ACL 之类的机制覆盖，"能读通"才是最终标准。
+  #
+  # 用 sudo -u 而不是 su：su 会去读 PAM 配置，且 nobody 的 shell 常被设为
+  # nologin，失败信息与"文件读不到"长得一样，容易把测试环境问题误判成产品缺陷。
+  # sudo -u 只切换用户，语义干净。
+  #
+  # 还要排除一个经典误报：即便文件本身是 0644，只要它所在的**目录链**有一级
+  # 对 others 不可进入（缺 x 位），nobody 照样读不到。那是夹具权限问题，
+  # 与被测的保存逻辑无关，所以先单独查一遍目录链，把两类原因区分开。
+  #
+  # 注意这里必须读权限位来判断，不能用 `[ -x "$dir" ]`：本脚本以 root 跑，
+  # 而 root 无视权限位，`-x` 对任何目录都返回真，守卫会形同虚设。
+  CHAIN_BAD=""
+  p="$CFG_FILE"
+  while [ -n "$p" ] && [ "$p" != "/" ]; do
+    p=$(dirname "$p")
+    pm=$(stat -c '%a' "$p" 2>/dev/null)
+    # 0001 位即 others 可进入。
+    { [ -n "$pm" ] && [ $(( 0$pm & 01 )) -ne 0 ]; } || { CHAIN_BAD="$p"; break; }
+  done
+
+  if [ -n "$CHAIN_BAD" ]; then
+    # 测试夹具自身不可进入，不计产品失败。
+    c_skip "非 root 读取验证：目录 $CHAIN_BAD 对 others 不可进入（夹具限制）"
+  elif ! command -v sudo >/dev/null 2>&1; then
+    c_skip "非 root 读取验证：环境无 sudo"
+  elif sudo -n -u nobody cat "$CFG_FILE" >/dev/null 2>&1; then
     c_ok "以 nobody 身份可读取配置文件"
   else
-    c_bad "以 nobody 身份无法读取配置文件（权限 $CFG_PERM）"
+    c_bad "以 nobody 身份无法读取配置文件（权限 $CFG_PERM, $CFG_OWNER）"
+    printf '      \033[2msudo 输出: %s\033[0m\n' \
+      "$(sudo -n -u nobody cat "$CFG_FILE" 2>&1 | head -2 | tr '\n' ' ')"
   fi
 else
   c_bad "配置文件不存在，无法检查权限: $CFG_FILE"
