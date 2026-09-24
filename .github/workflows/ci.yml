@@ -124,10 +124,12 @@ jobs:
         if: failure()
         run: |
           echo "::group::失败断言"
-          grep -n "✘" "${RUNNER_TEMP}/e2e.log" | head -20 | while IFS= read -r line; do
-            echo "::error::${line}"
+          # 连同紧随其后的诊断行一起输出：断言只说明"哪条挂了"，
+          # 缩进的诊断行才说明"为什么挂"。
+          grep -A6 "✘" "${RUNNER_TEMP}/e2e.log" | head -40 | while IFS= read -r line; do
+            [ -n "$line" ] && echo "::error::${line}"
           done
           echo "::endgroup::"
           echo "::group::统计"
-          tail -5 "${RUNNER_TEMP}/e2e.log"
+          tail -8 "${RUNNER_TEMP}/e2e.log"
           echo "::endgroup::"

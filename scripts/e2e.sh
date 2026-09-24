@@ -468,6 +468,16 @@ else
   printf '      \033[2m响应: %s\033[0m\n' "$(printf '%s' "$SETTINGS_RESP" | head -3)"
   printf '      \033[2m配置中的 mp3_bitrate: %s\033[0m\n' \
     "$(grep -o '"mp3_bitrate": *"[^"]*"' "$WORK/config/config.json" 2>/dev/null | head -1)"
+  # 诊断：把宿主机看到的文件、容器内看到的文件、以及接口自述都打出来。
+  # 只有这样才能区分"没写进去"和"写进了另一个文件"这两种完全不同的原因。
+  printf '      \033[2m宿主机文件 mtime/size: %s\033[0m\n' \
+    "$(stat -c '%y %s' "$WORK/config/config.json" 2>/dev/null)"
+  printf '      \033[2m容器内 /config 列表: %s\033[0m\n' \
+    "$(docker exec "$SVC" ls -la /config 2>&1 | tr '\n' '|' | head -c 400)"
+  printf '      \033[2m容器内 /config/config.json 的 mp3_bitrate: %s\033[0m\n' \
+    "$(docker exec "$SVC" sh -c 'grep -o "\"mp3_bitrate\": *\"[^\"]*\"" /config/config.json' 2>&1 | head -1)"
+  printf '      \033[2m接口自述 state.mp3Bitrate: %s\033[0m\n' \
+    "$(curl -s "http://127.0.0.1:18080/api/state" 2>/dev/null | grep -o '"mp3Bitrate":"[^"]*"' | head -1)"
 fi
 
 # 非法码率应被拒绝，且不能污染配置。
