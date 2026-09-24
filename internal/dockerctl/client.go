@@ -269,6 +269,59 @@ func (c *Client) LogsFollow(ctx context.Context, container string, since *time.T
 	return stream, nil
 }
 
+// LogsRange 一次性读取容器自 since 起至今的日志行，不跟随。
+//
+// 与 LogsFollow 的分工：follow 用于实时监控，本方法用于**回溯**——
+// 典型场景是容器刚拉起时，回查最近一段时间的日志里是否已经出现了
+// 关键词（比如应用一启动就打印"等待直播"），有则立即停止容器。
+//
+// 返回的行已按帧解复用（stdout/stderr 合并、剥离 8 字节帧头），
+// 空行被丢弃。为防意外的大日志拖垮内存，最多读取 8MB。
+func (c *Client) LogsRange(ctx context.Context, container string, since time.Time) ([]string, error) {
+	q := url.Values{}
+	q.Set("stdout", "1")
+	q.Set("stderr", "1")
+	q.Set("follow", "0")
+	q.Set("since", strconv.FormatInt(since.Unix(), 10))
+	q.Set("tail", "0")
+	path := "/containers/" + url.PathEscape(container) + "/logs?" + q.Encode()
+
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("读取容器 %s 日志失败: %w", container, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("读取容器 %s 日志失败: HTTP %d %s",
+			container, resp.StatusCode, apiMessage(body))
+	}
+
+	// 8MB 上限：一分钟内正常应用的日志远小于此，超出说明应用在刷屏，
+	// 此时截断是合理代价。bufio 包在 LimitReader 外面，保证不越过上限。
+	reader := bufio.NewReaderSize(io.LimitReader(resp.Body, 8<<20), 64*1024)
+	var lines []string
+	for {
+		frame, err := readLogFrame(reader)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return lines, fmt.Errorf("读取容器 %s 日志失败: %w", container, err)
+		}
+		for _, line := range strings.Split(strings.TrimRight(string(frame), "\n"), "\n") {
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	return lines, nil
+}
+
 // ---- 内部实现 ----
 
 // do 发起一次请求并读完全部响应体。

@@ -47,6 +47,14 @@ type fakeRunner struct {
 	streams        []*fakeStream
 	startErr       error
 	stopErr        error
+	// followErr 让 LogsFollow 直接失败，用于构造"实时监控不可用"的场景。
+	followErr error
+	// logsRangeFn 定制回查结果；nil 时返回空日志。
+	// 参数 since 是监控器计算出的回查窗口起点，供断言窗口语义。
+	logsRangeFn func(since time.Time) ([]string, error)
+
+	logsRangeCalls  int
+	logsRangeSinces []time.Time
 }
 
 func newFakeRunner() *fakeRunner { return &fakeRunner{} }
@@ -98,6 +106,9 @@ func (f *fakeRunner) RotateLogs(ctx context.Context, container string) error {
 }
 
 func (f *fakeRunner) LogsFollow(ctx context.Context, container string, since *time.Time) (dockerctl.StreamHandle, error) {
+	if f.followErr != nil {
+		return nil, f.followErr
+	}
 	s := newFakeStream()
 	f.mu.Lock()
 	f.streams = append(f.streams, s)
@@ -108,6 +119,30 @@ func (f *fakeRunner) LogsFollow(ctx context.Context, container string, since *ti
 		s.Close()
 	}()
 	return s, nil
+}
+
+func (f *fakeRunner) LogsRange(ctx context.Context, container string, since time.Time) ([]string, error) {
+	f.mu.Lock()
+	f.logsRangeCalls++
+	f.logsRangeSinces = append(f.logsRangeSinces, since)
+	fn := f.logsRangeFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(since)
+	}
+	return nil, nil
+}
+
+// lastLogsRangeSince 返回最近一次回查的窗口起点。
+// 回查跑在独立 goroutine 上，读取必须走 fake 的锁，
+// 否则 -race 下测试自身与回查 goroutine 构成数据竞争。
+func (f *fakeRunner) lastLogsRangeSince() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.logsRangeSinces) == 0 {
+		return time.Time{}
+	}
+	return f.logsRangeSinces[len(f.logsRangeSinces)-1]
 }
 
 func (f *fakeRunner) counts() (int, int, int, int) {
@@ -146,7 +181,13 @@ func newTestMonitor(t *testing.T, fn *fakeRunner, keywords []string, maxDur time
 		MaxRunDuration: int(maxDur.Seconds()),
 		Keywords:       config.StringList(keywords),
 	}
-	return New(cc, nil, fn, logging.New("test"))
+	m := New(cc, nil, fn, logging.New("test"))
+	// 把回溯检查的默认 15s 延迟压缩到毫秒级：
+	// 一来用例不必真等 15 秒，二来避免每个用例都留下一个
+	// 挂着 15s 定时器的 goroutine（测试进程退出前它们会集体醒来）。
+	m.sweepDelay = 50 * time.Millisecond
+	m.sweepTimeout = 500 * time.Millisecond
+	return m
 }
 
 // TestStartIdempotent 重复 Start 只应实际启动一次。

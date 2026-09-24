@@ -298,6 +298,9 @@ func (noopRunner) RotateLogs(ctx context.Context, container string) error       
 func (noopRunner) LogsFollow(ctx context.Context, container string, since *time.Time) (dockerctl.StreamHandle, error) {
 	return nil, fmt.Errorf("未实现")
 }
+func (noopRunner) LogsRange(ctx context.Context, container string, since time.Time) ([]string, error) {
+	return nil, nil
+}
 
 // TestCreateContainer 验证新增容器接口。
 func TestCreateContainer(t *testing.T) {

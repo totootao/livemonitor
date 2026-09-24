@@ -21,6 +21,7 @@ type Runner interface {
 	TruncateInternalLogs(ctx context.Context, container string) error
 	RotateLogs(ctx context.Context, container string) error
 	LogsFollow(ctx context.Context, container string, since *time.Time) (dockerctl.StreamHandle, error)
+	LogsRange(ctx context.Context, container string, since time.Time) ([]string, error)
 }
 
 // StopReason 描述容器停止的原因。
@@ -32,6 +33,18 @@ const (
 	ReasonTimeout   StopReason = "超过最大运行时长"
 	ReasonShutdown  StopReason = "程序退出"
 	ReasonKickstart StopReason = "被新的启动计划重新拉起"
+)
+
+// 启动回溯检查的默认参数。
+//
+// 时间预算：延迟 15s + 拉取日志 10s = 25s < 30s，
+// 保证"容器启动后 30 秒内完成回查"这一承诺。延迟的存在是给容器内应用
+// 留出启动并打印的时间——实测应用在启动后约 5 秒打印"等待直播"，
+// 查得太早日志里什么都还没有，查得太晚容器就白跑了一阵。
+const (
+	defaultSweepDelay   = 15 * time.Second
+	defaultSweepWindow  = time.Minute
+	defaultSweepTimeout = 10 * time.Second
 )
 
 // ContainerMonitor 管理单个容器的生命周期。
@@ -54,6 +67,11 @@ type ContainerMonitor struct {
 	// gen 是启动代次，避免旧的 goroutine 干扰新一轮启动。
 	gen uint64
 
+	// 启动回溯检查参数。New() 里设默认值，测试可改小以加速用例。
+	sweepDelay   time.Duration
+	sweepWindow  time.Duration
+	sweepTimeout time.Duration
+
 	// hooks 便于测试观察状态变化。
 	onStarted func(startedAt time.Time)
 	onStopped func(reason string)
@@ -66,12 +84,15 @@ func New(cc config.ContainerConfig, globalKeywords []string, c Runner, log *logg
 		kw = append(kw, globalKeywords...)
 	}
 	return &ContainerMonitor{
-		name:        cc.Name,
-		keywords:    kw,
-		maxDuration: time.Duration(cc.MaxRunDuration) * time.Second,
-		runner:      c,
-		log:         log,
-		done:        make(chan struct{}),
+		name:         cc.Name,
+		keywords:     kw,
+		maxDuration:  time.Duration(cc.MaxRunDuration) * time.Second,
+		runner:       c,
+		log:          log,
+		done:         make(chan struct{}),
+		sweepDelay:   defaultSweepDelay,
+		sweepWindow:  defaultSweepWindow,
+		sweepTimeout: defaultSweepTimeout,
 	}
 }
 
@@ -338,6 +359,7 @@ func (m *ContainerMonitor) enterRunning(startedAt time.Time) {
 
 	go m.watchLogs(runCtx, gen, startedAt)
 	go m.enforceMaxDuration(runCtx, gen, done)
+	go m.startupSweep(runCtx, gen, done, startedAt)
 }
 
 // Stop 停止容器。reason 用于日志与控制台展示。
@@ -441,6 +463,76 @@ func (m *ContainerMonitor) watchLogs(ctx context.Context, gen uint64, since time
 			}
 		}
 	}
+}
+
+// startupSweep 启动回溯检查：容器进入监控后，延迟片刻回查最近一段时间的日志。
+//
+// 与 watchLogs 的分工：
+//   - watchLogs 负责日志流建立**之后**产生的输出（实时）；
+//   - 本检查覆盖流建立前后的回溯窗口——特别是流建立失败的场景：
+//     LogsFollow 一旦出错，watchLogs 直接退出，实时监控就成了摆设，
+//     若应用一启动就打印"等待直播"，容器会一直挂着没人停。
+//
+// 行为：容器启动后 30 秒内（15s 延迟 + 10s 拉取），回查最近一分钟的日志，
+// 命中关键词立即停止容器。窗口起点不会早于本次启动——docker 的 json 日志
+// 在容器停止后并不会被清空，往前多看一秒都可能读到上一轮运行留下的
+// "等待直播"，把刚拉起的容器误杀。
+//
+// 每次启动（含接管）各执行一次；容器停止或被重新拉起（代次变化）时，
+// 尚未执行的检查随之作废。
+func (m *ContainerMonitor) startupSweep(ctx context.Context, gen uint64, done chan struct{}, startedAt time.Time) {
+	delay, window, timeout := m.sweepDelay, m.sweepWindow, m.sweepTimeout
+
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return
+	case <-done:
+		return
+	case <-timer.C:
+	}
+
+	// 窗口起点：最近一分钟，但不早于本次启动。
+	since := startedAt
+	if cutoff := time.Now().Add(-window); cutoff.After(since) {
+		since = cutoff
+	}
+
+	m.log.Info("启动回溯检查：回查 %s 以来的日志", since.Format("2006-01-02 15:04:05"))
+	fctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	lines, err := m.runner.LogsRange(fctx, m.name, since)
+	if err != nil {
+		// 因容器停止或程序退出而中断属正常流程，不值得告警；
+		// 其余失败（Docker 短暂不可达等）提示一句即可，实时监控仍在。
+		if ctx.Err() != nil {
+			return
+		}
+		m.log.Warn("启动回溯检查失败（不影响实时监控）: %v", err)
+		return
+	}
+
+	// 拉取期间容器可能已被停止或重新拉起，此时本轮检查已无意义。
+	m.mu.Lock()
+	keywords := append([]string(nil), m.keywords...)
+	stale := m.gen != gen || !m.running
+	m.mu.Unlock()
+	if stale {
+		return
+	}
+
+	for _, line := range lines {
+		cleaned := CleanLogLine(line)
+		for _, kw := range keywords {
+			if kw != "" && strings.Contains(cleaned, kw) {
+				m.log.Info("启动回溯检查命中关键词: %s", kw)
+				m.Stop(StopReason("启动回溯检查命中关键词 '" + kw + "'"))
+				return
+			}
+		}
+	}
+	m.log.Info("启动回溯检查完成，未命中关键词（共 %d 行）", len(lines))
 }
 
 // matchAndStop 检查单行日志是否命中关键词，命中则停止容器并返回 true。

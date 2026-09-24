@@ -864,16 +864,30 @@ else
   printf '      \033[2m文件内容: %s\033[0m\n' "$(cat "$STATE_FILE" 2>/dev/null | head -5 | sed 's/^/            /')"
 fi
 
-# 核心回归：重启服务后，当天已过点的任务不能再触发一次。
-docker restart "$ADOPT_SVC" >/dev/null 2>&1
-sleep 6
-RESTART_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
-
-if contains "$RESTART_LOG" "已恢复当天的调度记录"; then
+# 核心回归：服务进程结束后，当天已过点的任务不能再触发一次。
+#
+# 这里用 docker kill + docker start（模拟 kill -9 / 断电 / OOM 后重新拉起），
+# 而不是 docker restart：优雅退出（SIGTERM）会按设计停掉正在运行的容器
+# （"先停掉正在运行的容器，避免留下无人接管的运行实例"），重启后就
+# 没有容器可接管了；而崩溃场景里目标容器仍在跑，新进程启动后由
+# 启动接管逻辑收编——那才是接管的真实战场。
+# 用 start 而非 rm+run 还能保留累积日志，"恰好触发一次"等断言依赖它。
+docker kill "$ADOPT_SVC" >/dev/null 2>&1
+docker start "$ADOPT_SVC" >/dev/null 2>&1
+recover_seen=0
+for _ in $(seq 1 30); do
+  if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "已恢复当天的调度记录"; then
+    recover_seen=1; break
+  fi
+  sleep 1
+done
+if [ "$recover_seen" = "1" ]; then
   c_ok "重启后恢复了当天的调度记录"
 else
   c_bad "重启后未恢复调度记录"
 fi
+
+RESTART_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
 
 # "触发定时任务"在两次启动中合计只应出现一次。
 # 下限也一并断言：如果一次都没触发（比如服务压根没起来），
@@ -888,6 +902,27 @@ elif [ "$trigger_count" -eq 0 ]; then
 else
   c_bad "重启后重放了任务，触发 $trigger_count 次（期望 1）"
   printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$RESTART_LOG" | grep "触发定时任务" | head -5 | sed 's/^/            /')"
+fi
+
+# 启动回溯检查：接管后 30 秒内应回查最近一分钟的日志。
+#
+# 这是关键词停止的第二道网——日志流一旦建立失败，实时监控就是摆设，
+# 而容器内应用往往一启动就打印"等待直播"。回查在接管 15 秒后执行；
+# 崩溃拉起会让服务重新接管一次，拉起后最多 ~18s（启动+接管+15s 延迟）
+# 必然能看到回查完成，给到 40s 是给 CI 冷启动留余量。
+# 目标容器的日志只有 tick，回查应当完成且未命中。
+sweep_seen=0
+for _ in $(seq 1 40); do
+  if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "启动回溯检查完成"; then
+    sweep_seen=1; break
+  fi
+  sleep 1
+done
+if [ "$sweep_seen" = "1" ]; then
+  c_ok "启动回溯检查已执行（接管后 30 秒内回查日志）"
+else
+  c_bad "未见启动回溯检查完成日志"
+  printf '      \033[2m日志: %s\033[0m\n' "$(docker logs "$ADOPT_SVC" 2>&1 | tail -8 | sed 's/^/            /')"
 fi
 
 # 核心回归二：容器被外部停掉后，状态必须以 Docker 为准。

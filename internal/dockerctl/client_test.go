@@ -504,6 +504,7 @@ var _ interface {
 	TruncateInternalLogs(context.Context, string) error
 	RotateLogs(context.Context, string) error
 	LogsFollow(context.Context, string, *time.Time) (StreamHandle, error)
+	LogsRange(context.Context, string, time.Time) ([]string, error)
 } = (*Client)(nil)
 
 // 编译期断言：httpStream 实现 StreamHandle。
@@ -511,3 +512,63 @@ var _ StreamHandle = (*httpStream)(nil)
 
 // 确保 httptest 被引用（保留给将来可能的 HTTP 层测试）。
 var _ = httptest.NewRequest
+
+// ---- LogsRange：一次性回读历史日志 ----
+
+func TestLogsRangeParsesFrames(t *testing.T) {
+	f := newFakeEngine(t)
+	f.on(http.MethodGet, "/containers/zhangsan/logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/vnd.docker.raw-stream")
+		w.WriteHeader(http.StatusOK)
+		// 与 LogsFollow 相同的帧布局，外加空行，验证空行被丢弃。
+		writeFrame(w, "等待直播\n")
+		writeFrame(w, "第二条\n\n第三条\n")
+	})
+
+	lines, err := f.client().LogsRange(context.Background(), "zhangsan", time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("回读日志应成功: %v", err)
+	}
+	want := []string{"等待直播", "第二条", "第三条"}
+	if len(lines) != len(want) {
+		t.Fatalf("应返回 %d 行（空行丢弃），实际 %d 行: %v", len(want), len(lines), lines)
+	}
+	for i := range want {
+		if lines[i] != want[i] {
+			t.Errorf("第 %d 行应为 %q，实际 %q", i, want[i], lines[i])
+		}
+	}
+}
+
+// 请求参数：follow=0 且带 since。
+func TestLogsRangePassesParams(t *testing.T) {
+	f := newFakeEngine(t)
+	var gotQuery string
+	f.on(http.MethodGet, "/containers/zhangsan/logs", func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.RawQuery
+		w.WriteHeader(http.StatusOK)
+	})
+	_, err := f.client().LogsRange(context.Background(), "zhangsan", time.Unix(1700000000, 0))
+	if err != nil {
+		t.Fatalf("不应报错: %v", err)
+	}
+	if !strings.Contains(gotQuery, "since=1700000000") {
+		t.Errorf("应带上 since，实际 query: %s", gotQuery)
+	}
+	if !strings.Contains(gotQuery, "follow=0") {
+		t.Errorf("回读不应跟随，应带 follow=0，实际 query: %s", gotQuery)
+	}
+}
+
+func TestLogsRangeNotFound(t *testing.T) {
+	f := newFakeEngine(t)
+	f.json(http.MethodGet, "/containers/ghost/logs", http.StatusNotFound,
+		map[string]any{"message": "No such container: ghost"})
+	_, err := f.client().LogsRange(context.Background(), "ghost", time.Now())
+	if err == nil {
+		t.Fatal("应报错")
+	}
+	if !strings.Contains(err.Error(), "No such container") {
+		t.Errorf("应带上 Engine 消息，实际: %v", err)
+	}
+}

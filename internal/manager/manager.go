@@ -204,6 +204,12 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 	//（原脚本同样允许 docker 缺失，此时媒体转码仍可工作）。
 	if err := m.docker.Available(ctx); err != nil {
 		m.log.Warn("Docker Engine 不可达: %v，容器控制将不可用", err)
+	} else {
+		// 进程重启后，上一轮启动（或外部启动）的容器可能还在跑，
+		// 而当天的调度记录已落盘、调度器不会再触发它们——
+		// 若不在这里主动接管，这些容器会一直无人监控：
+		// 关键词不会停、超时不会停，启动回溯检查也没有执行的机会。
+		m.adoptRunningContainers()
 	}
 
 	// 探测转码依赖（ffmpeg）。缺了它 MP3 压缩这一步会全盘失败，
@@ -250,6 +256,36 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 	m.shutdown()
 	<-schedDone
 	return 0
+}
+
+// adoptRunningContainers 启动时接管已在运行的配置容器。
+//
+// 只对"配置里有、Docker 说在跑、但本进程没有在跟踪"的容器下发接管。
+// 接管走 mon.Start() 的接管分支：不会重新启动任何容器，
+// 只是挂上日志关键词监控、超时保护与启动回溯检查——
+// "重启不重放"的承诺不受影响，不重放的是**启动**，不是监控。
+//
+// 必须在确认 Docker 可达之后调用：查询失败时 SyncState 会保守地
+// 沿用"未运行"的旧值，若不设这道前提，就可能对一个实际在跑的容器
+// 误下发 start。
+func (m *Manager) adoptRunningContainers() {
+	snap := m.store.Snapshot()
+	for _, cc := range snap.Containers {
+		mon, ok := m.MonitorByName(cc.Name)
+		if !ok {
+			continue
+		}
+		// 容器没在跑（或查询失败），交给调度器按计划处理。
+		if !m.monitorRunning(mon) {
+			continue
+		}
+		// 已经在跟踪（本进程早先接管/启动过），不重复接管。
+		if mon.IsRunning() {
+			continue
+		}
+		m.log.Info("发现容器 %s 已在运行（可能来自上一轮进程或外部启动），接管监控", cc.Name)
+		go mon.Start()
+	}
 }
 
 // startWeb 启动 Web 管理服务。
