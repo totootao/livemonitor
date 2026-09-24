@@ -79,13 +79,109 @@ func New(cc config.ContainerConfig, globalKeywords []string, c Runner, log *logg
 func (m *ContainerMonitor) Name() string { return m.name }
 
 // IsRunning 返回当前是否处于已启动状态。
+//
+// 注意这里返回的是"本程序的记账状态"，不一定等于容器的真实状态：
+// 容器被 docker stop、自己退出或崩溃时，本程序不会收到通知。
+// 需要真实状态请用 SyncState。
 func (m *ContainerMonitor) IsRunning() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.running
 }
 
+// SyncState 向 Docker 核对容器的真实状态，并据此纠正内部记账。
+//
+// 返回纠正后的"是否处于运行中"。
+//
+// 存在的意义：m.running 只在 Start/Stop 被调用时更新，容器若被外部停掉
+// （docker stop、容器内进程退出、崩溃、docker rm），本程序无从知晓，
+// 这个标志就会一直停在 true。后果不只是界面显示"运行中"这么简单——
+// StartContainer 会以"已在运行中"拒绝启动一个实际已停止的容器，
+// StopContainer 会以"未在运行"拒绝停止，RunJobNow 同理。
+//
+// 所以对外汇报状态、以及任何"要不要启动/停止"的判断之前，
+// 都应先经过这里。查询失败时保守地沿用现有记账，不做纠正——
+// 宁可报旧状态，也不要因为一次网络抖动把运行中的容器标成已停止。
+func (m *ContainerMonitor) SyncState(ctx context.Context) bool {
+	m.mu.Lock()
+	believed := m.running
+	m.mu.Unlock()
+
+	state, err := m.runner.InspectState(ctx, m.name)
+	if err != nil {
+		// 容器不存在时，内部若还以为在运行，说明它被删掉了，同样要纠正。
+		if believed && isNotFound(err) {
+			m.log.Warn("容器已不存在，重置运行状态")
+			m.forgetRunning("容器已被删除")
+			return false
+		}
+		m.log.Debug("核对容器状态失败，沿用现有状态: %v", err)
+		return believed
+	}
+
+	actual := state.Running || state.Restarting
+	if believed == actual {
+		return actual
+	}
+
+	if !actual {
+		// 最关键的纠正：程序以为在跑，实际已经停了。
+		m.log.Warn("容器实际已停止（可能被外部停止或自行退出），重置运行状态")
+		m.forgetRunning("容器实际已停止")
+		return false
+	}
+
+	// 反向：程序以为已停，实际在跑。交由 Start 的接管逻辑处理，
+	// 这里只报告真实状态。
+	return true
+}
+
+// forgetRunning 把内部记账拉回"未运行"，并停掉仍在跑的日志监控 goroutine。
+// reason 只用于日志。
+func (m *ContainerMonitor) forgetRunning(reason string) {
+	m.mu.Lock()
+	if !m.running {
+		m.mu.Unlock()
+		return
+	}
+	m.running = false
+	m.stopFlag = true
+	cancel := m.cancel
+	gen := m.gen
+	done := m.done
+	m.mu.Unlock()
+
+	// 停掉日志跟踪，否则它会一直挂在容器上白耗资源。
+	if cancel != nil {
+		cancel()
+	}
+
+	m.mu.Lock()
+	if m.gen == gen && done != nil {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}
+	m.mu.Unlock()
+
+	if m.onStopped != nil {
+		m.onStopped(reason)
+	}
+}
+
+// isNotFound 判断错误是否表示容器不存在。
+// dockerctl 在 404 时返回的文案里含"不存在"，这里做一次宽松匹配，
+// 避免为此在接口上引入额外的错误类型。
+func isNotFound(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "不存在")
+}
+
 // Status 返回运行状态的快照，供 Web 界面展示。
+//
+// Running 来自内部记账，可能与容器真实状态不一致；
+// 需要准确值请在调用前先执行 SyncState。
 func (m *ContainerMonitor) Status() Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()

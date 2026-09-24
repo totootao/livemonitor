@@ -7,6 +7,7 @@
 package web
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -250,6 +251,16 @@ func (s *Server) buildContainerView(cc config.ContainerConfig, jobs []scheduler.
 	}
 
 	if mon, ok := s.opts.Monitor.MonitorByName(cc.Name); ok {
+		// 先向 Docker 核对真实状态，再展示。
+		// 只读内部记账会让被外部停掉的容器一直显示"运行中"。
+		// 这一步带超时且失败时沿用旧值，不会因为一次查询失败就误报已停止。
+		//
+		// 代价是每个容器一次 inspect 调用。容器数量在几十的量级，
+		// 而 /api/state 只在打开界面或轮询时触发，可以接受。
+		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		mon.SyncState(syncCtx)
+		syncCancel()
+
 		st := mon.Status()
 		v.Running = st.Running
 		v.StartedAt = st.StartedAt

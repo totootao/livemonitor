@@ -392,7 +392,9 @@ func (m *Manager) StartContainer(name string) error {
 	if !ok {
 		return fmt.Errorf("容器 %q 不存在", name)
 	}
-	if mon.IsRunning() {
+	// 必须先核对真实状态：内部记账可能陈旧（容器被外部停掉后没人通知），
+	// 直接采信会把"启动一个已停止的容器"误报成"已在运行中"。
+	if m.monitorRunning(mon) {
 		return fmt.Errorf("容器 %q 已在运行中", name)
 	}
 	go mon.Start()
@@ -405,7 +407,7 @@ func (m *Manager) StopContainer(name string) error {
 	if !ok {
 		return fmt.Errorf("容器 %q 不存在", name)
 	}
-	if !mon.IsRunning() {
+	if !m.monitorRunning(mon) {
 		return fmt.Errorf("容器 %q 未在运行", name)
 	}
 	go mon.Stop(monitor.StopReason("手动停止"))
@@ -418,12 +420,22 @@ func (m *Manager) RunJobNow(name string) error {
 	if !ok {
 		return fmt.Errorf("容器 %q 不存在", name)
 	}
-	if mon.IsRunning() {
+	if m.monitorRunning(mon) {
 		return fmt.Errorf("容器 %q 已在运行中", name)
 	}
 	m.log.Info("手动触发容器启动: %s", name)
 	go mon.Start()
 	return nil
+}
+
+// monitorRunning 返回容器的真实运行状态，并顺带纠正陈旧的内部记账。
+//
+// 所有"要不要启动/停止"的判断都要走这里，不能直接读 IsRunning()——
+// 后者只反映本程序的记账，容器被 docker stop、自行退出或崩溃后并不会更新。
+func (m *Manager) monitorRunning(mon *monitor.ContainerMonitor) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return mon.SyncState(ctx)
 }
 
 // UpdateSettings 更新全局设置；影响所有容器的项需要 Reload。
