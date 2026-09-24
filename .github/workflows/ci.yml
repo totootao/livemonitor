@@ -88,7 +88,9 @@ jobs:
         run: |
           echo "----- 容器列表 -----"
           docker ps -a || true
-          for c in lmci-svc lmci-target; do
+          for c in lmci-svc lmci-target lmci-adopt-svc lmci-adopt-target; do
             echo "----- $c 日志 -----"
             docker logs "$c" 2>&1 | tail -60 || true
           done
+          echo "----- 调度状态文件 -----"
+          cat "${RUNNER_TEMP:-/tmp}"/lmci.*/adopt/config/scheduler-state.json 2>/dev/null || true

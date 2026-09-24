@@ -79,7 +79,10 @@ must_contain() {
 }
 
 cleanup() {
-  docker rm -f "$SVC" "$TARGET" >/dev/null 2>&1
+  # 一并清理 7.5 节新增的临时容器，否则中途退出会留下占用固定端口的残留实例，
+  # 下一次运行就会因为端口冲突而失败。
+  docker rm -f "$SVC" "$TARGET" \
+    "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" >/dev/null 2>&1
   # 只删本次测试的临时目录，前缀严格匹配避免误伤。
   case "$WORK" in
     /tmp/${PREFIX}.*) rm -rf "$WORK" ;;
@@ -513,27 +516,41 @@ mkdir -p "$WORK/adopt/audio"
 
 ADOPT_SVC="${ADOPT_PREFIX}-svc"
 docker rm -f "$ADOPT_SVC" >/dev/null 2>&1
-docker run -d --name "$ADOPT_SVC" -p 18081:8080 \
+# 不映射端口：这一段只通过 docker logs 与宿主机文件观察行为，
+# 省掉固定端口映射可以避免与其它测试或宿主服务抢占同一端口。
+docker run -d --name "$ADOPT_SVC" \
   -v "$ADOPT_CFG:/config" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -e LIVEMONITOR_CONFIG=/config/config.json \
   "$IMAGE" >/dev/null 2>&1
 
 # 等到调度器至少轮询过一轮（tick 1s），且日志监控已挂上。
+# CI 冷启动较慢，给到 45s；一旦服务进程已退出就立刻停下并报告，
+# 免得把"服务没起来"误判成"没被接管"。
 adopted=0
-for _ in $(seq 1 20); do
-  if contains "$(docker logs "$ADOPT_SVC" 2>&1)" "接管监控"; then
+for _ in $(seq 1 45); do
+  ADOPT_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
+  if contains "$ADOPT_LOG" "接管监控"; then
     adopted=1; break
+  fi
+  SVC_STATE=$(docker inspect -f '{{.State.Running}}' "$ADOPT_SVC" 2>/dev/null || echo missing)
+  if [ "$SVC_STATE" = "false" ] || [ "$SVC_STATE" = "missing" ]; then
+    break
   fi
   sleep 1
 done
 
 ADOPT_LOG=$(docker logs "$ADOPT_SVC" 2>&1)
+if [ "${SVC_STATE:-true}" = "false" ]; then
+  c_bad "7.5 节的服务实例提前退出（配置或启动失败）"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$ADOPT_LOG" | tail -8 | sed 's/^/            /')"
+fi
+
 if [ "$adopted" = "1" ]; then
   c_ok "已运行的容器被接管（而非跳过）"
 else
   c_bad "已运行的容器未被接管"
-  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$ADOPT_LOG" | tail -6 | sed 's/^/            /')"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$ADOPT_LOG" | tail -8 | sed 's/^/            /')"
 fi
 
 # 旧的错误行为会打出这句。它不该再出现。
