@@ -1,0 +1,31 @@
+{
+  "watch_dir": "/audio",
+  "history_dir": "",
+  "check_interval": 30,
+  "stable_delay": 60,
+  "archive_after_hours": 45,
+  "mp3_bitrate": "32k",
+  "monitor_keywords": ["等待直播"],
+  "containers": [
+    { "name": "dafeiguanshijie",    "start_times": "20:01",                                       "max_run_duration": 10800 },
+    { "name": "liugelaile",         "start_times": ["17:03","17:13","17:33","18:45","18:50","18:55","19:00","19:06"], "max_run_duration": 10800 },
+    { "name": "ahaishuoshi",        "start_times": ["11:02","11:07","18:02","18:07"],              "max_run_duration": 10800 },
+    { "name": "dachengshijieguan",  "start_times": "18:39",                                       "max_run_duration": 4000 },
+    { "name": "zhangjun",           "start_times": "11:45",                                       "max_run_duration": 10800 },
+    { "name": "zhangji",            "start_times": "20:02",                                       "max_run_duration": 10800 },
+    { "name": "wangjianshuoshi",    "start_times": "13:37",                                       "max_run_duration": 10800 },
+    { "name": "dazhuoshuoshier",    "start_times": "17:01",                                       "max_run_duration": 60000 },
+    { "name": "zhuchirenruinan",    "start_times": "12:02",                                       "max_run_duration": 10800 },
+    { "name": "liuhukan",           "start_times": "20:51",                                       "max_run_duration": 10800 },
+    { "name": "minggeshijiao",      "start_times": "20:51",                                       "max_run_duration": 10800 },
+    { "name": "qige",               "start_times": "20:04",                                       "max_run_duration": 10800 },
+    { "name": "ruigequanqiushi",    "start_times": "20:42",                                       "max_run_duration": 10800 },
+    { "name": "zhubodali",          "start_times": "20:42",                                       "max_run_duration": 10800 },
+    { "name": "qigongmenghua",      "start_times": "19:02",                                       "max_run_duration": 10800 },
+    { "name": "zhuchirensongfei",   "start_times": "12:32",                                       "max_run_duration": 7200 },
+    { "name": "xingebaogao",        "start_times": "11:02",                                       "max_run_duration": 10800 },
+    { "name": "yiyang",             "start_times": ["11:02","11:07"],                             "max_run_duration": 6400 },
+    { "name": "tongliaolaoli",      "start_times": ["12:02","20:32"],                             "max_run_duration": 10800 },
+    { "name": "kongwen",            "start_times": ["07:12","07:15"],                             "max_run_duration": 10800 }
+  ]
+}

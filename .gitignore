@@ -1,0 +1,17 @@
+# 构建产物
+/bin/
+/livemonitor
+
+# 本地配置与数据（避免把真实容器名与路径提交到仓库）
+/config.json
+/data/
+
+# 测试与覆盖率产物
+*.out
+coverage.html
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
+.DS_Store

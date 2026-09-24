@@ -1,0 +1,27 @@
+services:
+  livemonitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: livemonitor:1.0.0
+    container_name: livemonitor
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      LIVEMONITOR_LOG_LEVEL: info
+      # 如需以指定用户运行（处理挂载目录属主），取消下面两行注释。
+      # PUID: "1000"
+      # PGID: "1000"
+    volumes:
+      # 必须挂载 docker socket 才能控制宿主机容器。
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # 媒体目录：宿主机路径按需修改。
+      - ./data/audio:/audio
+      # 配置目录：首次启动会自动生成 config.json。
+      - ./data/config:/config
+    # 日志驱动与轮转限制：原脚本的"清理 docker 日志"在宿主机侧更可靠的解法。
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
