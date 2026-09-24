@@ -5,13 +5,20 @@ FROM golang:1.23-alpine AS builder
 
 WORKDIR /src
 
-# 本项目仅依赖两个纯 Go 库（MP3 编解码），go.mod 里没有 cgo 依赖。
 # GOPROXY 可在构建时覆盖：国内网络下 proxy.golang.org 常常不可达，
 # 可传入 --build-arg GOPROXY=https://goproxy.cn,direct。
 # 先声明再置空，避免默认值在 COPY 之前被缓存成旧层的环境变量。
 ARG GOPROXY=https://proxy.golang.org,direct
 ENV GOPROXY=${GOPROXY}
-COPY go.mod go.sum ./
+
+# 本项目是**纯标准库**实现：go.mod 里一个 require 都没有，go.sum 因而不存在。
+# 所以只 COPY go.mod。别再把 go.sum 加回来——文件不存在时 docker build
+# 会在计算缓存键那一步直接报 "/go.sum": not found，而且错误信息里
+# 看不出是缺文件，只会说 "failed to compute cache key"。
+COPY go.mod ./
+
+# 依赖分层缓存用的。没有依赖时 go mod download 是空操作，
+# 保留它是为了将来真的加了依赖时这一层仍然成立。
 RUN go mod download
 
 # 复制源码。测试文件已由 .dockerignore 排除。
