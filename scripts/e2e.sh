@@ -86,7 +86,8 @@ cleanup() {
   docker rm -f "$SVC" "$TARGET" \
     "${ADOPT_SVC:-}" "${ADOPT_TARGET:-}" "${WATCH2:-}" \
     "${REPLAY_SVC:-}" "${REPLAY_PLAIN:-}" "${REPLAY_TTY:-}" \
-    "${CLR_SVC:-}" "${CLR_TARGET:-}" >/dev/null 2>&1
+    "${CLR_SVC:-}" "${CLR_TARGET:-}" \
+    "${EV_SVC:-}" "${EV_TARGET:-}" "${EVX:-}" >/dev/null 2>&1
   # 只删本次测试的临时目录，前缀严格匹配避免误伤。
   case "$WORK" in
     /tmp/${PREFIX}.*) rm -rf "$WORK" ;;
@@ -1323,6 +1324,127 @@ else
 fi
 
 docker rm -f "$CLR_SVC" "$CLR_TARGET" >/dev/null 2>&1
+
+# ---------- 7.8 运行期间接管外部启动的容器 ----------
+#
+# 启动时的接管（7.5）只覆盖"程序启动那一刻已在运行的容器"。若程序运行
+# 期间有人手动启动（或 restart 策略拉起）配置里的容器，之前没有任何机制
+# 会发现它——容器会一直跑到有人手动停它。
+#
+# 新行为：服务订阅 Engine 的容器事件流（type=container 且 action=start/restart，
+# 服务端过滤），收到配置容器的外部启动事件后实时接管监控。
+#
+# 时序上刻意让目标容器先 create 不 start：服务启动时它处于停止状态，
+# 启动接管逻辑不会碰它——此后从外部 docker start，才是本节要验证的
+# 事件路径。无关容器用来验证"配置外的启动不接管"。
+section "7.8 运行期间接管外部启动的容器"
+
+EV_PREFIX="${PREFIX}-evt"
+EV_CFG="$WORK/evt/config"
+mkdir -p "$EV_CFG"
+chmod 777 "$EV_CFG"
+
+EV_TARGET="${EV_PREFIX}-target"
+EVX="${EV_PREFIX}-other"
+EV_SVC="${EV_PREFIX}-svc"
+docker rm -f "$EV_TARGET" "$EVX" "$EV_SVC" >/dev/null 2>&1
+
+# 目标容器：启动瞬间打印关键词后挂住（echo 发生在监控建立之前，
+# 命中必须靠接管后的历史回放——顺带回归 7.6 修复的行为）。
+docker create --name "$EV_TARGET" alpine:3.22 sh -c \
+  'echo "等待直播"; sleep 600' >/dev/null 2>&1
+# 无关容器：不在服务配置里，验证事件不会引发越权接管。
+docker create --name "$EVX" alpine:3.22 sh -c \
+  'sleep 600' >/dev/null 2>&1
+
+cat > "$EV_CFG/config.json" << EOF
+{
+  "watch_dir": "$WORK/evt/audio",
+  "mp3_bitrate": "32k",
+  "check_interval": 3600,
+  "monitor_keywords": "等待直播",
+  "containers": [{
+    "name": "$EV_TARGET",
+    "start_times": "23:59",
+    "max_run_duration": 3600,
+    "keywords": "等待直播"
+  }]
+}
+EOF
+mkdir -p "$WORK/evt/audio"
+
+docker run -d --name "$EV_SVC" \
+  -v "$EV_CFG:/config" \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  -e LIVEMONITOR_CONFIG=/config/config.json \
+  "$IMAGE" >/dev/null 2>&1
+# 等服务完成启动并订阅事件流；此刻目标容器仍是停止状态。
+sleep 4
+
+# 模拟人为启动：先配置内的目标容器，再配置外的无关容器。
+docker start "$EV_TARGET" >/dev/null 2>&1
+docker start "$EVX" >/dev/null 2>&1
+
+# 断言 1：事件被实时发现并接管。
+evt_adopted=0
+for _ in $(seq 1 45); do
+  if contains "$(docker logs "$EV_SVC" 2>&1)" "检测到容器 ${EV_TARGET} 被外部启动，接管监控"; then
+    evt_adopted=1; break
+  fi
+  SVC_STATE=$(docker inspect -f '{{.State.Running}}' "$EV_SVC" 2>/dev/null || echo missing)
+  if [ "$SVC_STATE" = "false" ] || [ "$SVC_STATE" = "missing" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ "$evt_adopted" = "1" ]; then
+  c_ok "运行期间被外部启动的容器被实时接管"
+else
+  c_bad "运行期间外部启动的容器未被接管"
+  printf '      \033[2m日志: %s\033[0m\n' "$(docker logs "$EV_SVC" 2>&1 | tail -8 | sed 's/^/            /')"
+fi
+
+# 断言 2：接管真的挂上了日志监控。服务启动时目标容器未运行，
+# 启动阶段不会出现这句，它只能来自事件接管路径。
+if contains "$(docker logs "$EV_SVC" 2>&1)" "开始监控新日志"; then
+  c_ok "事件接管后日志关键词监控已启动"
+else
+  c_bad "事件接管后未启动日志监控"
+fi
+
+# 断言 3：关键词被命中并停止容器。
+# echo 发生在监控建立之前，命中走的是"接管后回放"路径（7.6 修复的行为）；
+# 即使实时流错过，启动回溯检查也会在 30 秒内兜底，两种路径都算通过。
+evt_stopped=0
+for _ in $(seq 1 60); do
+  if [ "$(docker inspect -f '{{.State.Running}}' "$EV_TARGET" 2>/dev/null || echo missing)" != "true" ]; then
+    evt_stopped=1; break
+  fi
+  sleep 1
+done
+EV_LOG=$(docker logs "$EV_SVC" 2>&1)
+if [ "$evt_stopped" = "1" ]; then
+  c_ok "被接管的容器因关键词命中被停止"
+else
+  c_bad "被接管的容器未被停止（关键词监控未生效？）"
+  printf '      \033[2m日志: %s\033[0m\n' "$(printf '%s' "$EV_LOG" | grep -E "关键词|监控|停止" | tail -8 | sed 's/^/            /')"
+fi
+if printf '%s' "$EV_LOG" | grep -qE "检测到关键词: 等待直播|启动回溯检查命中关键词"; then
+  c_ok "命中走日志关键词路径（实时流或回溯检查）"
+else
+  c_bad "未见关键词命中记录，容器可能被超时等其他路径误停"
+fi
+
+# 断言 4：配置外的容器不被接管、不被停止。
+if contains "$EV_LOG" "检测到容器 ${EVX} 被外部启动"; then
+  c_bad "配置外的容器被错误接管"
+elif [ "$(docker inspect -f '{{.State.Running}}' "$EVX" 2>/dev/null || echo missing)" = "true" ]; then
+  c_ok "配置外的容器未被接管、未被停止"
+else
+  c_bad "配置外的容器意外消失（可能被误停）"
+fi
+
+docker rm -f "$EV_SVC" "$EV_TARGET" "$EVX" >/dev/null 2>&1
 
 # ---------- 8. 优雅退出 ----------
 

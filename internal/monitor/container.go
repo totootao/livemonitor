@@ -68,6 +68,11 @@ type ContainerMonitor struct {
 	// gen 是启动代次，避免旧的 goroutine 干扰新一轮启动。
 	gen uint64
 
+	// startMu 把整个 Start 串行化。调度器、Web API、启动接管与外部启动
+	// 事件可能并发触发 Start：没有它，两个调用可能在 InspectState 的
+	// 竞态窗口内都判定"未在运行"，各自 enterRunning 产生双监控。
+	startMu sync.Mutex
+
 	// 启动回溯检查参数。New() 里设默认值，测试可改小以加速用例。
 	sweepDelay   time.Duration
 	sweepWindow  time.Duration
@@ -263,6 +268,13 @@ func (m *ContainerMonitor) Update(cc config.ContainerConfig, globalKeywords []st
 // 不能混为一谈。现在改为接管，并按其**真实启动时间**继续计时，
 // 避免一个早就该停的容器因为被接管而重新获得一整轮运行时长。
 func (m *ContainerMonitor) Start() {
+	// 启动全程串行：调度器、Web API、启动接管、外部启动事件可能同时
+	// 触发 Start。不加这把锁，两个调用可能在 InspectState 的竞态窗口内
+	// 都判定"未在运行"，随后各自 enterRunning，产生双日志流与混乱的代次。
+	// 锁内首行就是幂等检查，重复调用只会被忽略。
+	m.startMu.Lock()
+	defer m.startMu.Unlock()
+
 	m.mu.Lock()
 	if m.running {
 		m.mu.Unlock()

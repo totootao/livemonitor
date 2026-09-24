@@ -210,6 +210,9 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 		// 若不在这里主动接管，这些容器会一直无人监控：
 		// 关键词不会停、超时不会停，启动回溯检查也没有执行的机会。
 		m.adoptRunningContainers()
+		// 运行期间的持续接管：订阅 Engine 事件流，任何人（或 restart 策略）
+		// 在程序运行期间启动了配置里的容器，都会被实时发现并接管监控。
+		go m.watchContainerEvents(ctx)
 	}
 
 	// 探测转码依赖（ffmpeg）。缺了它 MP3 压缩这一步会全盘失败，
@@ -256,6 +259,67 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 	m.shutdown()
 	<-schedDone
 	return 0
+}
+
+// watchContainerEvents 订阅 Engine 事件流，实现"运行期间的持续接管"：
+// 程序启动时的接管只覆盖那一刻已在运行的容器，此后任何人（或 restart 策略）
+// 启动了配置里的容器，都由这个循环实时发现并接管监控。
+// 流断开（Engine 重启等）时按固定间隔重连，ctx 取消后退出。
+func (m *Manager) watchContainerEvents(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		ch, err := m.docker.ContainerStartEvents(ctx)
+		if err != nil {
+			m.log.Warn("订阅容器事件失败（5 秒后重试）: %v", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+			}
+			continue
+		}
+
+		for name := range ch {
+			m.adoptExternallyStarted(name)
+		}
+
+		// channel 关闭 = 事件流断开（Engine 重启、连接被断）。
+		// 退避后重连，避免 Engine 不可达时紧密打转。
+		m.log.Warn("容器事件流已断开，5 秒后重连")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// adoptExternallyStarted 处理单个 start/restart 事件：
+// 只接管"配置里有、本程序尚未跟踪"的容器。
+//
+// 本程序自己的启动同样会产生 start 事件——那时监控已建立（IsRunning 为
+// true），直接跳过；即便撞上"事件先到、enterRunning 后完成"的竞态窗口，
+// mon.Start 的启动互斥锁与幂等检查也会把重复接管挡掉。
+func (m *Manager) adoptExternallyStarted(name string) {
+	mon, ok := m.MonitorByName(name)
+	if !ok {
+		return // 不是配置里的容器，与程序无关
+	}
+	if mon.IsRunning() {
+		return // 已在跟踪：大概率是本程序自己的启动事件
+	}
+	// 事件与真实状态可能不一致（迟到的旧事件、瞬时退出），
+	// 以 SyncState 的核对结果为准。
+	if !m.monitorRunning(mon) {
+		return
+	}
+	m.log.Info("检测到容器 %s 被外部启动，接管监控", name)
+	go mon.Start()
 }
 
 // adoptRunningContainers 启动时接管已在运行的配置容器。

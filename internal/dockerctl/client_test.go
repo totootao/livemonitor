@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -738,6 +739,84 @@ func TestClearLogsUnreachablePath(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "不可达") {
 		t.Errorf("错误信息应说明文件不可达，实际: %v", err)
+	}
+}
+
+// ---- 容器启动事件流 ----
+
+// start/restart 事件应投递容器名；其它类型、其它动作、缺 name、坏 JSON 均应被过滤。
+// 同时验证 filters 参数请求了服务端过滤（type=container 且 event=start/restart），
+// 避免繁忙宿主机上无关事件刷爆长连接。
+func TestContainerStartEventsDeliversNames(t *testing.T) {
+	f := newFakeEngine(t)
+	var gotFilters map[string]map[string]bool
+	f.on(http.MethodGet, "/events", func(w http.ResponseWriter, r *http.Request) {
+		raw := r.URL.Query().Get("filters")
+		if err := json.Unmarshal([]byte(raw), &gotFilters); err != nil {
+			t.Errorf("filters 应为合法 JSON，实际: %q（%v）", raw, err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		lines := []string{
+			`{"Type":"container","Action":"start","Actor":{"Attributes":{"name":"alpha"}}}`,
+			`{"Type":"image","Action":"start","Actor":{"Attributes":{"name":"ignored-image"}}}`,
+			`{"Type":"container","Action":"die","Actor":{"Attributes":{"name":"ignored-die"}}}`,
+			`{"Type":"container","Action":"health_status","Actor":{"Attributes":{"name":"ignored-health"}}}`,
+			`{"Type":"container","Action":"restart","Actor":{"Attributes":{"name":"beta"}}}`,
+			`{"Type":"container","Action":"start","Actor":{"Attributes":{}}}`,
+			"not-json",
+		}
+		for _, line := range lines {
+			fmt.Fprintln(w, line)
+		}
+	})
+	ch, err := f.client().ContainerStartEvents(context.Background())
+	if err != nil {
+		t.Fatalf("订阅事件不应报错: %v", err)
+	}
+	var names []string
+	for name := range ch {
+		names = append(names, name)
+	}
+	want := []string{"alpha", "beta"}
+	if !slices.Equal(names, want) {
+		t.Errorf("应投递 %v，实际 %v", want, names)
+	}
+	if !gotFilters["type"]["container"] ||
+		!gotFilters["event"]["start"] || !gotFilters["event"]["restart"] {
+		t.Errorf("filters 应请求 container 类型的 start/restart 事件，实际: %v", gotFilters)
+	}
+}
+
+// ctx 取消后事件流应退出并关闭 channel，让消费方（重连循环）能感知并重建。
+func TestContainerStartEventsStopsOnContextCancel(t *testing.T) {
+	f := newFakeEngine(t)
+	hold := make(chan struct{})
+	f.on(http.MethodGet, "/events", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintln(w, `{"Type":"container","Action":"start","Actor":{"Attributes":{"name":"alpha"}}}`)
+		// 立即冲刷，否则响应头滞留在 server 缓冲里，客户端 Do 阶段就等不到流。
+		if fl, ok := w.(http.Flusher); ok {
+			fl.Flush()
+		}
+		<-hold // 保持连接不断开，模拟真实的事件长连接
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer close(hold)
+	ch, err := f.client().ContainerStartEvents(ctx)
+	if err != nil {
+		t.Fatalf("订阅事件不应报错: %v", err)
+	}
+	if name := <-ch; name != "alpha" {
+		t.Fatalf("应收到 alpha，实际: %q", name)
+	}
+	cancel()
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Error("ctx 取消后 channel 应关闭")
+		}
+	case <-time.After(2 * time.Second):
+		t.Error("ctx 取消后 channel 未在超时内关闭")
 	}
 }
 

@@ -377,6 +377,91 @@ func (c *Client) inspectTTY(ctx context.Context, container string) (bool, error)
 	return info.Config.Tty, nil
 }
 
+// ContainerStartEvents 订阅 Engine 的容器启动事件流。
+//
+// 返回的 channel 持续推送**容器名**（不含前导斜杠）：人为的 docker start、
+// docker restart 以及 restart 策略的自动拉起（start / restart 事件）都会到达。
+// 其他事件（die、kill、health_status 等）在服务端就被过滤掉，不会消耗调用方。
+//
+// 这是"运行期间接管外部启动容器"的数据来源：程序启动时的接管只覆盖
+// 启动那一刻已在运行的容器，之后被人为拉起的容器靠这个流实时发现。
+//
+// 流断开（Engine 重启、连接被断等）时 channel 关闭，调用方负责重连；
+// ctx 取消时同样关闭。
+func (c *Client) ContainerStartEvents(ctx context.Context) (<-chan string, error) {
+	q := url.Values{}
+	// filters 是 URL 编码的 JSON 映射；在服务端过滤能省掉大量无关事件
+	//（busy 宿主机上 health_status 等事件非常频繁）。
+	filters := map[string]map[string]bool{
+		"type":  {"container": true},
+		"event": {"start": true, "restart": true},
+	}
+	raw, err := json.Marshal(filters)
+	if err != nil {
+		return nil, fmt.Errorf("构造事件过滤参数失败: %w", err)
+	}
+	q.Set("filters", string(raw))
+	path := "/events?" + q.Encode()
+	c.log.Debug("订阅容器启动事件: %s", path)
+
+	req, err := c.newRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, err
+	}
+	// 事件流是无限长度的，必须用流式响应。
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("订阅容器事件失败: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("订阅容器事件失败: HTTP %d %s",
+			resp.StatusCode, apiMessage(body))
+	}
+
+	ch := make(chan string, 32)
+	go func() {
+		defer close(ch)
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		// 单行事件很小，但给足余量，避免长属性列表把 scanner 顶爆。
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			var ev struct {
+				Type   string `json:"Type"`
+				Action string `json:"Action"`
+				Actor  struct {
+					Attributes map[string]string `json:"Attributes"`
+				} `json:"Actor"`
+			}
+			if err := json.Unmarshal(scanner.Bytes(), &ev); err != nil {
+				c.log.Debug("解析容器事件失败: %v", err)
+				continue
+			}
+			if ev.Type != "container" {
+				continue
+			}
+			if ev.Action != "start" && ev.Action != "restart" {
+				continue
+			}
+			name := ev.Actor.Attributes["name"]
+			if name == "" {
+				continue
+			}
+			select {
+			case ch <- name:
+			case <-ctx.Done():
+				return
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			c.log.Debug("容器事件流结束: %v", err)
+		}
+	}()
+	return ch, nil
+}
+
 // LogsRange 一次性读取容器自 since 起至今的日志行，不跟随。
 //
 // 与 LogsFollow 的分工：follow 用于实时监控，本方法用于**回溯**——
