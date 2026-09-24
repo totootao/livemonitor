@@ -7,9 +7,9 @@
 <title>livemonitor 定时任务管理</title>
 <style>
   :root {
-    --bg: #f5f6f8;
+    --bg: #f4f6fa;
     --panel: #ffffff;
-    --panel-2: #fafbfc;
+    --panel-2: #f8fafc;
     --border: #e2e5ea;
     --text: #1f2329;
     --muted: #6b7280;
@@ -21,8 +21,8 @@
     --warn-soft: #fdf3e3;
     --err: #dc2626;
     --err-soft: #fdeaea;
-    --radius: 10px;
-    --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 12px rgba(16, 24, 40, .05);
+    --radius: 12px;
+    --shadow: 0 1px 2px rgba(16, 24, 40, .04), 0 8px 24px -8px rgba(16, 24, 40, .08);
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -40,18 +40,39 @@
       --warn-soft: #33280f;
       --err: #f87171;
       --err-soft: #3a1a1a;
-      --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 4px 12px rgba(0, 0, 0, .25);
+      --shadow: 0 1px 2px rgba(0, 0, 0, .25), 0 10px 28px -10px rgba(0, 0, 0, .4);
     }
   }
   * { box-sizing: border-box; }
   html, body { margin: 0; padding: 0; }
   body {
-    background: var(--bg);
+    /* 底色之上铺两团极淡的主色光晕：让页面不像"白纸"，又不干扰阅读。
+       color-mix 基于 --accent，深浅色模式自动适配。 */
+    background:
+      radial-gradient(1100px 480px at 88% -120px, color-mix(in srgb, var(--accent) 7%, transparent), transparent 70%),
+      radial-gradient(900px 420px at -8% 30%, color-mix(in srgb, var(--accent) 4%, transparent), transparent 70%),
+      var(--bg);
+    background-attachment: fixed;
     color: var(--text);
     font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
           "Hiragino Sans GB", "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
+  /* 数字一律用等宽数字：倒计时、统计跳动时不抖动 */
+  .stat-inline b, .mono, .ov-value, .tag, th {
+    font-variant-numeric: tabular-nums;
+  }
+  /* 细滚动条，浅色不突兀（Firefox 走 scrollbar-width） */
+  * { scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 40%, transparent) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--muted) 35%, transparent);
+    background-clip: content-box;
+    border: 2px solid transparent;
+    border-radius: 6px;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: color-mix(in srgb, var(--muted) 60%, transparent); }
+  ::-webkit-scrollbar-track { background: transparent; }
   a { color: var(--accent); }
   code, .mono {
     font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
@@ -69,8 +90,16 @@
     max-width: 1280px; margin: 0 auto;
     display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
   }
-  .brand { font-size: 16px; font-weight: 650; letter-spacing: .2px; }
-  .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .brand {
+    display: flex; align-items: center; gap: 9px;
+    font-size: 16px; font-weight: 650; letter-spacing: .2px;
+  }
+  .brand .logo { display: grid; place-items: center; width: 30px; height: 30px;
+    border-radius: 9px; color: #fff;
+    background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 62%, #7c3aed));
+    box-shadow: 0 2px 6px color-mix(in srgb, var(--accent) 35%, transparent);
+  }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 2px; font-size: 12px; }
   .topbar-spacer { flex: 1; }
   .stat-inline { color: var(--muted); font-size: 12px; display: flex; gap: 14px; flex-wrap: wrap; }
   .stat-inline b { color: var(--text); font-weight: 600; }
@@ -90,7 +119,14 @@
     border-bottom: 1px solid var(--border);
     background: var(--panel-2);
   }
-  .card-head h2 { margin: 0; font-size: 15px; font-weight: 620; }
+  .card-head h2 { margin: 0; font-size: 15px; font-weight: 620; position: relative; padding-left: 12px; }
+  .card-head h2::before {
+    content: ""; position: absolute; left: 0; top: 50%;
+    transform: translateY(-50%);
+    width: 4px; height: 14px; border-radius: 2px;
+    background: linear-gradient(180deg, var(--accent),
+      color-mix(in srgb, var(--accent) 50%, transparent));
+  }
   .card-head .hint { color: var(--muted); font-size: 12px; }
   .card-head .spacer { flex: 1; }
   .card-body { padding: 16px; }
@@ -103,13 +139,26 @@
     padding: 7px 13px;
     border-radius: 8px;
     cursor: pointer;
-    transition: background .12s, border-color .12s, opacity .12s;
+    transition: background .12s, border-color .12s, opacity .12s,
+                transform .08s, box-shadow .12s, filter .12s;
     white-space: nowrap;
   }
   button:hover:not(:disabled) { background: var(--panel-2); border-color: var(--muted); }
+  button:active:not(:disabled) { transform: translateY(1px) scale(.99); }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button:disabled { opacity: .45; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-  button.primary:hover:not(:disabled) { filter: brightness(1.08); background: var(--accent); }
+  button.primary {
+    background: linear-gradient(180deg,
+      color-mix(in srgb, #fff 14%, var(--accent)), var(--accent));
+    border-color: color-mix(in srgb, #000 12%, var(--accent));
+    color: #fff;
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+  button.primary:hover:not(:disabled) {
+    background: linear-gradient(180deg,
+      color-mix(in srgb, #fff 20%, var(--accent)), var(--accent));
+    filter: brightness(1.05);
+  }
   button.danger { color: var(--err); border-color: color-mix(in srgb, var(--err) 40%, var(--border)); }
   button.danger:hover:not(:disabled) { background: var(--err-soft); }
   button.tiny { padding: 4px 9px; font-size: 12px; border-radius: 6px; }
@@ -152,11 +201,35 @@
   .times { display: flex; gap: 5px; flex-wrap: wrap; }
   .times .tag { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 
-  .empty { text-align: center; color: var(--muted); padding: 36px 12px; }
+  .empty { text-align: center; color: var(--muted); padding: 40px 12px; }
+  .empty svg { display: block; margin: 0 auto 10px; opacity: .45; }
   .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
   .kv { display: grid; gap: 3px; }
   .kv .k { color: var(--muted); font-size: 12px; }
   .kv .v { font-weight: 560; }
+  /* 概览小卡：图标 + 标题一行，值大字，辅助信息小字 */
+  .ov-item {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+    display: grid; gap: 2px;
+    align-content: start;
+    transition: border-color .15s, background .15s;
+  }
+  .ov-item:hover { border-color: color-mix(in srgb, var(--accent) 35%, var(--border)); }
+  .ov-head {
+    display: flex; align-items: center; gap: 7px;
+    color: var(--muted); font-size: 12px; font-weight: 550;
+    margin-bottom: 3px;
+  }
+  .ov-head .ic { color: var(--accent); flex: 0 0 auto; }
+  .ov-value {
+    font-size: 16px; font-weight: 620;
+    word-break: break-all;
+  }
+  .ov-value.mono { font-size: 13px; font-weight: 560; }
+  .ov-sub { color: var(--muted); font-size: 12px; word-break: break-all; }
   .row-actions { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 14px; }
 
   dialog {
@@ -169,6 +242,11 @@
     box-shadow: 0 20px 50px rgba(0, 0, 0, .25);
   }
   dialog::backdrop { background: rgba(0, 0, 0, .45); }
+  dialog[open] { animation: dlg-in .16s ease-out; }
+  @keyframes dlg-in {
+    from { opacity: 0; transform: translateY(10px) scale(.985); }
+    to   { opacity: 1; transform: none; }
+  }
   .dialog-head { padding: 16px 18px 0; font-weight: 620; font-size: 15px; }
   .dialog-body { padding: 16px 18px; display: grid; gap: 14px; }
   .dialog-foot {
@@ -193,8 +271,13 @@
   @keyframes slide-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
   .swatch { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
-  .dot-ok { background: var(--ok); }
+  .dot-ok { background: var(--ok); animation: pulse 2.2s ease-out infinite; }
   .dot-idle { background: var(--muted); }
+  @keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 color-mix(in srgb, var(--ok) 45%, transparent); }
+    70%  { box-shadow: 0 0 0 6px transparent; }
+    100% { box-shadow: 0 0 0 0 transparent; }
+  }
   .spin { display: inline-block; animation: spin 1s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
 
@@ -286,7 +369,17 @@
 
 <header class="topbar">
   <div class="topbar-inner">
-    <div class="brand">livemonitor <small>定时任务管理</small></div>
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2.5" y="4" width="19" height="13" rx="2.5"></rect>
+          <path d="M6 10.5h2.5l1.5-3 3 6 1.5-3H18"></path>
+          <path d="M9 21h6"></path>
+        </svg>
+      </span>
+      <span>livemonitor <small>定时任务管理</small></span>
+    </div>
     <div class="topbar-spacer"></div>
     <div class="stat-inline" id="statLine"></div>
     <button id="btnRefresh" title="立即刷新（页面每 5 秒自动刷新）">刷新</button>
@@ -329,7 +422,15 @@
         </thead>
         <tbody id="tbody"></tbody>
       </table>
-      <div class="empty" id="emptyHint" hidden>暂无容器，点击「新增容器」开始配置。</div>
+      <div class="empty" id="emptyHint" hidden>
+        <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <rect x="2.5" y="4" width="19" height="13" rx="2.5" stroke-dasharray="3 2.5"></rect>
+          <path d="M6 10.5h2.5l1.5-3 3 6 1.5-3H18"></path>
+          <path d="M9 21h6"></path>
+        </svg>
+        暂无容器，点击「新增容器」开始配置。
+      </div>
     </div>
   </section>
 
@@ -476,6 +577,40 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+// ---- 内联图标 ----
+// 图标全部为 stroke=currentColor 的内联 SVG：跟随文字颜色、自动适配
+// 深浅色，且不引入任何外部资源（页面必须保持离线单文件可用）。
+const ICONS = {
+  clock:
+    '<circle cx="12" cy="12" r="8.5" stroke-width="1.8"/>' +
+    '<path d="M12 7.5v4.8l3 1.8" stroke-width="1.8"/>',
+  folder:
+    '<path d="M3.5 7a2 2 0 0 1 2-2h4.2l2 2.4h6.8a2 2 0 0 1 2 2v8.1a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2V7z" stroke-width="1.8" stroke-linejoin="round"/>',
+  wave:
+    '<path d="M3.5 12h3l1.6-3.8 3 7.6 1.6-3.8h7.8" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>',
+  server:
+    '<rect x="4" y="4" width="16" height="7" rx="1.6" stroke-width="1.8"/>' +
+    '<rect x="4" y="13" width="16" height="7" rx="1.6" stroke-width="1.8"/>' +
+    '<path d="M7.4 7.5h.01M7.4 16.5h.01" stroke-width="2.2" stroke-linecap="round"/>',
+};
+
+function svgIcon(name, size = 15) {
+  const NS = "http://www.w3.org/2000/svg";
+  const svg = document.createElementNS(NS, "svg");
+  svg.setAttribute("viewBox", "0 0 24 24");
+  svg.setAttribute("width", size);
+  svg.setAttribute("height", size);
+  svg.setAttribute("fill", "none");
+  svg.setAttribute("stroke", "currentColor");
+  svg.setAttribute("stroke-linecap", "round");
+  svg.setAttribute("stroke-linejoin", "round");
+  svg.setAttribute("aria-hidden", "true");
+  svg.classList.add("ic");
+  // 内容是编译期常量（ICONS），不含任何用户输入，innerHTML 安全。
+  svg.innerHTML = ICONS[name] || "";
+  return svg;
+}
+
 // ---- 状态渲染 ----
 
 let state = null;
@@ -495,28 +630,28 @@ function render() {
     el("span", { class: "stat-tz", text: "时区 " + state.timezone }),
   );
 
-  // 概览
+  // 概览：图标小卡（大值 + 辅助行）
   const uptime = state.uptimeSeconds;
   $("#overview").replaceChildren(
-    el("div", { class: "kv" }, [
-      el("div", { class: "k", text: "服务启动时间" }),
-      el("div", { class: "v mono", text: new Date(state.startedAt).toLocaleString() }),
-      el("div", { class: "k", text: "已运行 " + fmtDuration(uptime) }),
+    el("div", { class: "ov-item" }, [
+      el("div", { class: "ov-head" }, [svgIcon("clock"), el("span", { text: "服务运行" })]),
+      el("div", { class: "ov-value", text: fmtDuration(uptime) }),
+      el("div", { class: "ov-sub", text: "启动于 " + new Date(state.startedAt).toLocaleString() }),
     ]),
-    el("div", { class: "kv" }, [
-      el("div", { class: "k", text: "媒体目录" }),
-      el("div", { class: "v mono", text: state.video.watchDir || "—" }),
-      el("div", { class: "k", text: "归档目录 " + (state.video.historyDir || "—") }),
+    el("div", { class: "ov-item" }, [
+      el("div", { class: "ov-head" }, [svgIcon("wave"), el("span", { text: "待转码队列" })]),
+      el("div", { class: "ov-value", text: state.video.pending + " 个文件" }),
+      el("div", { class: "ov-sub", text: "输出码率 " + state.settings.mp3Bitrate }),
     ]),
-    el("div", { class: "kv" }, [
-      el("div", { class: "k", text: "待转码队列" }),
-      el("div", { class: "v", text: state.video.pending + " 个文件" }),
-      el("div", { class: "k", text: "输出码率 " + state.settings.mp3Bitrate }),
+    el("div", { class: "ov-item" }, [
+      el("div", { class: "ov-head" }, [svgIcon("folder"), el("span", { text: "媒体目录" })]),
+      el("div", { class: "ov-value mono", text: state.video.watchDir || "—" }),
+      el("div", { class: "ov-sub", text: "归档目录 " + (state.video.historyDir || "—") }),
     ]),
-    el("div", { class: "kv" }, [
-      el("div", { class: "k", text: "服务器时间" }),
-      el("div", { class: "v mono", text: new Date(state.serverTime).toLocaleString() }),
-      el("div", { class: "k", text: "配置文件 " + state.settings.configPath }),
+    el("div", { class: "ov-item" }, [
+      el("div", { class: "ov-head" }, [svgIcon("server"), el("span", { text: "服务器" })]),
+      el("div", { class: "ov-value mono", text: new Date(state.serverTime).toLocaleString() }),
+      el("div", { class: "ov-sub", text: "配置文件 " + state.settings.configPath }),
     ]),
   );
 

@@ -52,7 +52,6 @@ func TestIndexHasNoExternalResources(t *testing.T) {
 	page := string(indexHTML)
 
 	for _, bad := range []string{
-		"http://",
 		"https://",
 		"<script src=",
 		"<link rel=\"stylesheet\"",
@@ -61,6 +60,15 @@ func TestIndexHasNoExternalResources(t *testing.T) {
 		if strings.Contains(page, bad) {
 			t.Errorf("页面引用了外部资源 %q，会破坏离线可用性", bad)
 		}
+	}
+	// "http://" 需要单独查：http://www.w3.org/2000/svg 是 SVG 的 XML
+	// 命名空间**标识符**——固定字符串，只用于 createElementNS/命名空间判定，
+	// 浏览器绝不会对它发起网络请求，不算外部资源。
+	// 其余任何 http:// 引用（图片、字体、脚本）都仍然禁止。
+	const svgNS = "http://www.w3.org/2000/svg"
+	rest := strings.ReplaceAll(page, svgNS, "")
+	if strings.Contains(rest, "http://") {
+		t.Errorf("页面引用了外部资源 http://（命名空间 %q 之外），会破坏离线可用性", svgNS)
 	}
 }
 
