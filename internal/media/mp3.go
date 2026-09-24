@@ -1,4 +1,4 @@
-// Package media 提供媒体文件处理能力：MP3 码率解析、纯 Go 重编码、目录扫描与归档。
+// Package media 提供媒体文件处理能力：MP3 码率解析、调 ffmpeg 重编码、目录扫描与归档。
 package media
 
 import (

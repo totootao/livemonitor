@@ -18,9 +18,9 @@ import (
 
 // VideoExtensions 是被识别为媒体的扩展名集合。
 //
-// 只保留 MP3：转码改为纯 Go 实现后，解码端只支持 MP3，
-// 其他格式没有可用的纯 Go 解码器（见 transcoder.go 的说明）。
-// 扫描到曾经的视频/音频扩展名时会给出告警日志，提示需要先转成 MP3。
+// 只保留 MP3：转码用的是为 MP3 转码专门裁剪过的 ffmpeg 子集
+// （见 docker/README-ffmpeg.md），编译时就没带 AAC/FLAC/视频解码器，
+// 因此其他格式处理不了。扫描到这些扩展名时会给出告警日志，提示先转成 MP3。
 var VideoExtensions = map[string]bool{
 	".mp3": true,
 }
@@ -214,6 +214,14 @@ func (p *Processor) HistoryDir() string { return p.historyDir }
 
 // Pending 返回待转码队列长度，供 Web 界面展示。
 func (p *Processor) Pending() int { return p.queue.Len() }
+
+// TranscoderAvailable 探测转码依赖是否就绪，供启动自检使用。
+func (p *Processor) TranscoderAvailable() error {
+	if p.transcoder == nil {
+		return errors.New("未配置转码器")
+	}
+	return p.transcoder.Available()
+}
 
 // Start 启动扫描与转码工作协程。
 func (p *Processor) Start(parent context.Context) {
@@ -432,7 +440,7 @@ func (p *Processor) warnUnsupported(path, ext string) {
 	p.warnedUnsupported[path] = true
 	p.warnMu.Unlock()
 
-	p.log.Warn("跳过不支持的格式 %s（%s）：纯 Go 转码只处理 MP3，请先将其转为 MP3",
+	p.log.Warn("跳过不支持的格式 %s（%s）：转码器只处理 MP3，请先将其转为 MP3",
 		path, ext)
 }
 

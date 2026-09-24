@@ -72,8 +72,9 @@ jobs:
       - name: 构建镜像
         run: docker build -t livemonitor:ci .
 
-      # ffmpeg 仅用于生成测试素材（不同码率、带/不带 Xing 头），
-      # 被测镜像自身并不包含 ffmpeg —— 这一点由脚本的第 1 组用例断言。
+      # 被测镜像**自带** ffmpeg——一个为 MP3→MP3 裁剪过的 1.4MB 静态二进制，
+      # 转码全靠它。但它没有 lavfi/lavc 的 sine 源，造不出测试音频，
+      # 所以素材仍然必须在宿主机上用完整版 ffmpeg 生成：这一步不能删。
       - name: 安装 ffmpeg（生成测试素材用）
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 

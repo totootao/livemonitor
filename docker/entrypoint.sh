@@ -28,6 +28,13 @@ if [ ! -S /var/run/docker.sock ]; then
     echo "[entrypoint] 警告: 未检测到 /var/run/docker.sock，容器控制功能将不可用"
 fi
 
+# 检查转码依赖的 ffmpeg 是否存在。
+# 只告警不退出：没有它程序仍能跑（容器定时启停、日志监控、归档都不受影响），
+# 只是 MP3 压缩这一步会失败。直接退出反而会把"少了个二进制"升级成"服务起不来"。
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    echo "[entrypoint] 警告: 未找到 ffmpeg，MP3 压缩功能将不可用（容器与归档功能不受影响）"
+fi
+
 # 仅在 run 子命令上追加 -web，避免 init/check 等命令因未知 flag 报错。
 set -- "$@"
 case "${1:-run}" in

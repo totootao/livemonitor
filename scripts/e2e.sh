@@ -16,8 +16,10 @@
 # 网络受限时（如 CI 沙箱）可追加构建参数，无需改动 Dockerfile：
 #   BUILD=1 EXTRA_BUILD_ARGS="--build-arg GOPROXY=https://goproxy.cn,direct" bash scripts/e2e.sh
 #
-# 依赖：docker、curl、python3。（ffmpeg 可选——仅用于生成测试音频素材，
-# 缺失时自动降级为用本仓库的转码器自身生成。）
+# 依赖：docker、curl、python3、ffmpeg、ffprobe。
+# ffmpeg/ffprobe 用于在**宿主机**生成测试音频素材并校验产物规格——
+# 镜像里那个 ffmpeg 是为 MP3→MP3 裁剪的（无 lavfi），造不出音频，替不了它。
+# 缺失时会跳过第 2/5/5.5 节的素材相关断言并明确标记 skip，不会静默通过。
 set -uo pipefail
 
 IMAGE="${IMAGE:-totootao/livemonitor:latest}"
@@ -134,18 +136,58 @@ chmod -R 777 "$WORK"
 
 section "1. 镜像内容与静态属性"
 
-# 这轮改动的核心诉求就是"镜像里不该再有 ffmpeg / docker CLI"。
-MISSING=$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
-  for b in ffmpeg ffprobe docker dockerd; do
+# 镜像里现在带一个为 MP3 转码专门裁剪的 ffmpeg（约 1.4MB），转码全靠它。
+# 但它必须是"裁剪版"：只要 mp3 解封装 + file 协议，没有 lavfi/s16le/编码器之外的杂物。
+# 一旦有人换成完整版 ffmpeg，镜像会从 18MB 涨到 150MB 左右，这条断言负责拦住。
+#
+# ffprobe / ffplay / docker / dockerd 仍然不应该出现：
+#   - ffprobe/ffplay 是完整版 ffmpeg 附带的，裁剪版没有
+#   - docker CLI 已由 Docker Engine API（HTTP）取代，dockerd 也绝不进镜像
+PRESENT=$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c '
+  for b in ffmpeg ffprobe ffplay docker dockerd; do
     command -v "$b" >/dev/null 2>&1 && echo "$b"
   done
   exit 0
 ' 2>/dev/null)
-if [ -z "$MISSING" ]; then
-  c_ok "ffmpeg / ffprobe / docker CLI 均不存在"
+
+if contains "$PRESENT" "ffmpeg"; then
+  c_ok "镜像内存在 ffmpeg（转码依赖就绪）"
 else
-  c_bad "镜像内仍有不应存在的程序: $MISSING"
+  c_bad "镜像内缺少 ffmpeg，MP3 压缩功能不可用（实际内容: ${PRESENT:-无}）"
+  echo "        提示: Dockerfile 的 COPY docker/ffmpeg /usr/local/bin/ffmpeg 是否被删掉了？"
 fi
+
+# 裁剪版校验：`-formats` 在裁剪构建下只列出 mp3 一种解封装格式。
+# 完整版会列出上百种（含 lavfi），据此区分"裁剪版"与"完整版"。
+FF_INFO=$(docker run --rm --entrypoint ffmpeg "$IMAGE" -hide_banner -version 2>&1)
+must_contain "ffmpeg 可执行且能打印版本" "$FF_INFO" "ffmpeg version"
+
+# 明确断言未被替换成完整版：lavfi 若可用，说明镜像里塞了完整 ffmpeg。
+LAVFI_PROBE=$(docker run --rm --entrypoint ffmpeg "$IMAGE" \
+  -hide_banner -loglevel error -f lavfi -i "sine=duration=0.1" -f null - 2>&1)
+if contains "$LAVFI_PROBE" "Unknown input format" || contains "$LAVFI_PROBE" "lavfi"; then
+  c_ok "ffmpeg 为裁剪版（无 lavfi，符合预期）"
+else
+  c_bad "ffmpeg 疑似完整版（lavfi 可用，镜像体积会失控）"
+  echo "        输出: $(printf '%s' "$LAVFI_PROBE" | head -2)"
+fi
+
+# LGPL 合规：静态链接的 ffmpeg 必须随附许可证原文。
+LGPL=$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c \
+  'wc -c < /usr/local/share/doc/ffmpeg/COPYING.LGPLv2.1 2>/dev/null' 2>/dev/null)
+if [ -n "$LGPL" ] && [ "$LGPL" -gt 20000 ] 2>/dev/null; then
+  c_ok "随附 LGPLv2.1 许可证原文（${LGPL} 字节）"
+else
+  c_bad "缺少 ffmpeg 的 LGPL 许可证原文（实际: ${LGPL:-无}）"
+fi
+
+for b in ffprobe ffplay docker dockerd; do
+  if contains "$PRESENT" "$b"; then
+    c_bad "镜像内不应存在的程序: $b"
+  else
+    c_ok "镜像内无 $b"
+  fi
+done
 
 must "livemonitor 二进制可执行（version）" \
   docker run --rm --entrypoint livemonitor "$IMAGE" version
@@ -167,32 +209,50 @@ must_contain "TZ 环境变量生效" "$TZ_OUT" "CST"
 section "2. 测试素材"
 
 # 三个不同码率的 MP3，用于验证"高于阈值才重编码"。
+#
+# 素材必须在**宿主机**上用 ffmpeg 生成，不能借助镜像内的 ffmpeg：
+# 镜像里那个是为 MP3→MP3 裁剪的，只有 mp3 解封装和 file 协议，
+# 既没有 lavfi 也没有 lavc 的 sine 源，根本造不出音频。
+# 所以 CI 里 apt-get install ffmpeg 那一步是必需的，不能删。
+#
+# 必须显式加 -ac 2：lavfi 的 sine 源默认是**单声道**，
+# 不加的话素材本身就是单声道，第 5 节"产物为立体声"那条断言就形同虚设
+# ——单声道进、单声道出同样能通过，测不出任何东西。
 gen_with_ffmpeg() {
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "sine=frequency=440:duration=6:sample_rate=44100" \
-    -c:a libmp3lame -b:a "$1" "$2" 2>/dev/null
+    -ac 2 -c:a libmp3lame -b:a "$1" "$2" 2>/dev/null
 }
 
 have_ffmpeg=0
 command -v ffmpeg >/dev/null 2>&1 && have_ffmpeg=1
 
+# 宿主机 ffmpeg 还必须带 lavfi（Alpine 的 ffmpeg 包、Debian 的 ffmpeg 包都带）。
+HOST_LAVFI=0
 if [ "$have_ffmpeg" = "1" ]; then
+  if ffmpeg -hide_banner -loglevel error -f lavfi -i "sine=duration=0.05" -f null - >/dev/null 2>&1; then
+    HOST_LAVFI=1
+  fi
+fi
+
+if [ "$have_ffmpeg" = "1" ] && [ "$HOST_LAVFI" = "1" ]; then
   # -write_xing 0 关掉 LAME 的 Xing/Info 信息帧。
   # 需要单独测信息帧场景时，另一个文件 high.mp3 保持默认（带信息帧），
   # 这样两种文件布局都覆盖到。
-  gen_with_ffmpeg 192k "$WORK/audio/high.mp3" && c_ok "生成 high.mp3（192k，带 Xing 信息帧）"
+  gen_with_ffmpeg 192k "$WORK/audio/high.mp3" && c_ok "生成 high.mp3（192k 立体声，带 Xing 信息帧）"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "sine=frequency=440:duration=6:sample_rate=44100" \
-    -c:a libmp3lame -b:a 32k -write_xing 0 "$WORK/audio/low.mp3" 2>/dev/null \
-    && c_ok "生成 low.mp3（32k CBR，关闭 Xing 头）"
+    -ac 2 -c:a libmp3lame -b:a 32k -write_xing 0 "$WORK/audio/low.mp3" 2>/dev/null \
+    && c_ok "生成 low.mp3（32k CBR 立体声，关闭 Xing 头）"
   ffmpeg -hide_banner -loglevel error -y \
     -f lavfi -i "sine=frequency=440:duration=6:sample_rate=44100" \
-    -c:a libmp3lame -b:a 128k "$WORK/audio/mid.mp3" 2>/dev/null \
-    && c_ok "生成 mid.mp3（128k）"
+    -ac 2 -c:a libmp3lame -b:a 128k "$WORK/audio/mid.mp3" 2>/dev/null \
+    && c_ok "生成 mid.mp3（128k 立体声）"
   # 素材必须是"放置已久"的，否则会被 stable_delay 拦下（见下方说明）。
   touch -d '2 hours ago' "$WORK/audio"/*.mp3
 else
-  c_skip "宿主机无 ffmpeg，素材将由容器内转码器生成"
+  c_skip "宿主机缺 ffmpeg 或 lavfi，跳过素材生成"
+  echo "        本机素材缺失会连带跳过第 4 节的压缩断言，请安装带 lavfi 的 ffmpeg。"
 fi
 
 # 注意：配置里 stable_delay 写 0 会被 applyDefaults 回落到默认 60 秒
@@ -204,34 +264,6 @@ fi
 head -c 3000 /dev/urandom > "$WORK/audio/broken.mp3"
 head -c 3000 /dev/urandom > "$WORK/audio/stream.ts"
 c_ok "生成 broken.mp3（随机字节）与 stream.ts（不支持的格式）"
-
-if [ ! -f "$WORK/audio/high.mp3" ]; then
-  # 无 ffmpeg 时的降级路径：先造一段 WAV 再由容器转成 MP3。
-  # 这里直接用 python 写一个 16bit 单声道 WAV，再用容器的 probe 确认。
-  python3 - "$WORK/audio/high.wav" <<'PY'
-import math, struct, sys, wave
-path = sys.argv[1]
-rate, secs, freq = 44100, 6, 440
-with wave.open(path, "wb") as w:
-    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
-    frames = bytearray()
-    for i in range(rate * secs):
-        v = int(12000 * math.sin(2 * math.pi * freq * i / rate))
-        frames += struct.pack("<h", v)
-    w.writeframes(bytes(frames))
-PY
-  c_ok "生成 high.wav（供降级路径使用）"
-
-  # 用容器里的 go-mp3 转一次，得到测试用 MP3。
-  mkdir -p "$WORK/seed"
-  cp "$WORK/audio/high.wav" "$WORK/seed/high.wav"
-  cat > "$WORK/seed/config.json" <<EOF
-{"watch_dir":"/seed","history_dir":"","check_interval":1,"stable_delay":0,
- "archive_after_hours":1,"mp3_bitrate":"128k","monitor_keywords":["x"],
- "containers":[{"name":"seed-noop","start_times":"23:59","max_run_duration":60}]}
-EOF
-  c_skip "跳过降级素材生成（无 ffmpeg 时不影响主流程验证）"
-fi
 
 # ---------- 3. init / check 子命令 ----------
 
@@ -320,9 +352,31 @@ fi
 SVC_LOG=$(docker logs "$SVC" 2>&1)
 
 must_contain "日志含转换开始"      "$SVC_LOG" "开始转换"
-must_contain "日志含目标参数"      "$SVC_LOG" "目标 32k / 单声道 / 22050Hz"
+must_contain "日志含目标参数"      "$SVC_LOG" "目标 32k / 44100Hz / 立体声"
 must_contain "日志含转换成功"      "$SVC_LOG" "转换成功"
 must_contain "日志含删除源文件"    "$SVC_LOG" "已删除源文件"
+
+# 断言"码率落在 32k 附近"而不是精确等于 32000。
+#
+# LAME 的 CBR 32k 实际报出来是 32.5k 上下（帧头填充、Xing 帧、容器开销都会算进去），
+# ffprobe 读的是 format.bit_rate，实测在 32484~32896 之间浮动。
+# 写死 32000 只会得到一条时灵时不灵的用例，而且它测的是"填充细节"而非"是否压到了 32k"。
+assert_bitrate_near() {
+  local desc="$1" probe="$2"
+  local br
+  br=$(printf '%s\n' "$probe" | grep '^bit_rate=' | head -1 | cut -d= -f2)
+  if [ -z "$br" ]; then
+    c_bad "$desc（未解析到 bit_rate）"
+    printf '      \033[2m实际: %s\033[0m\n' "$(printf '%s' "$probe" | tr '\n' ' ')"
+    return
+  fi
+  # 允许 30000~36000：既排除"没压"（会报 128k/192k），也排除压过头。
+  if [ "$br" -ge 30000 ] && [ "$br" -le 36000 ]; then
+    c_ok "$desc（bit_rate=$br）"
+  else
+    c_bad "$desc（bit_rate=$br，期望 30000~36000）"
+  fi
+}
 
 # 关键：不支持格式应被跳过并告警，而不是静默无反应。
 must_contain "不支持的 .ts 被跳过并告警" "$SVC_LOG" "跳过不支持的格式"
@@ -345,9 +399,11 @@ if [ "$have_ffmpeg" = "1" ] && [ -f "$WORK/audio/high.mp3" ]; then
     -show_entries format=duration,bit_rate -show_entries stream=sample_rate,channels \
     -of default=noprint_wrappers=1 "$WORK/audio/high.mp3" 2>/dev/null)
 
-  must_contain "产物码率为 32k"      "$probe_out" "bit_rate=32000"
-  must_contain "产物采样率 22050"    "$probe_out" "sample_rate=22050"
-  must_contain "产物为单声道"        "$probe_out" "channels=1"
+  must_contain "产物采样率 44100"    "$probe_out" "sample_rate=44100"
+  # 产物必须是立体声。素材本身是立体声（第 2 节加了 -ac 2），
+  # ffmpeg 不传 -ac 时保持输入规格，所以这条能真正测出"声道被正确保留"。
+  must_contain "产物为立体声"        "$probe_out" "channels=2"
+  assert_bitrate_near "产物码率在 32k 附近" "$probe_out"
 
   # 时长必须基本不变——这是上一轮踩过的坑（帧参数算错会导致时长严重偏短）。
   dur=$(printf '%s\n' "$probe_out" | grep '^duration=' | cut -d= -f2)
@@ -368,7 +424,88 @@ else
   c_skip "宿主机无 ffprobe，跳过产物规格校验"
 fi
 
-# 低码率文件不应被重编码（防止自身的产物被反复压）。
+# ---------- 5.5 容器内 ffmpeg 直接转码 ----------
+#
+# 第 5 节验的是"服务跑完一轮之后产物长什么样"，属于端到端的间接验证。
+# 这一节绕过服务，直接在容器里拿 ffmpeg 转一次，回答两个第 5 节答不了的问题：
+#   1) 镜像里的那个二进制**真的能跑**吗（静态链接、musl、缺 so 都不会在 -version 暴露）
+#   2) 转码产物是否真的是 44.1kHz 立体声 —— 这是替换掉纯 Go 实现后最直接的行为变化
+#
+# 素材来自宿主机（第 2 节生成）。容器内的裁剪版 ffmpeg 没有 lavfi，
+# 造不出音频，只能吃现成的 MP3，所以这里必须依赖宿主机 ffmpeg 已就绪。
+
+section "5.5 容器内 ffmpeg 直接转码"
+
+# 本节的素材自己造：不依赖第 2 节是否成功。
+# 用 192k 立体声，这样"产物保持 44100/立体声"才是有效断言——
+# 如果输入本身就是单声道，输出是单声道也说明不了问题。
+if [ "$have_ffmpeg" = "1" ] && [ "$HOST_LAVFI" = "1" ]; then
+  ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i "sine=frequency=660:duration=4:sample_rate=44100" \
+    -ac 2 -c:a libmp3lame -b:a 192k "$WORK/audio/probe-src.mp3" 2>/dev/null
+fi
+
+if [ -f "$WORK/audio/probe-src.mp3" ]; then
+  IN_CONTAINER=$(docker run --rm \
+    -v "$WORK/audio:/mnt" \
+    --entrypoint /bin/sh "$IMAGE" -c \
+    'ffmpeg -hide_banner -loglevel error -i /mnt/probe-src.mp3 -b:a 32k /mnt/probe-out.mp3 -y; echo "rc=$?"' 2>&1)
+  if [ -f "$WORK/audio/probe-out.mp3" ]; then
+    c_ok "容器内 ffmpeg 转码成功（产物 $(wc -c <"$WORK/audio/probe-out.mp3") 字节）"
+  else
+    c_bad "容器内 ffmpeg 转码失败"
+    printf '      \033[2m输出: %s\033[0m\n' "$(printf '%s' "$IN_CONTAINER" | tail -3 | tr '\n' ' ')"
+  fi
+
+  # 产物规格：ffmpeg 默认保持输入规格（44.1kHz 立体声），且码率锁定 32k。
+  if [ -f "$WORK/audio/probe-out.mp3" ]; then
+    OUT_PROBE=$(ffprobe -hide_banner -v error \
+      -show_entries format=bit_rate -show_entries stream=sample_rate,channels \
+      -of default=noprint_wrappers=1 "$WORK/audio/probe-out.mp3" 2>/dev/null)
+    must_contain "容器内产物码率 32k"   "$OUT_PROBE" "bit_rate=32"
+    must_contain "容器内产物 44100Hz"   "$OUT_PROBE" "sample_rate=44100"
+    must_contain "容器内产物立体声"     "$OUT_PROBE" "channels=2"
+    assert_bitrate_near "容器内产物码率在 32k 附近" "$OUT_PROBE"
+  fi
+
+  # 幂等性：把产物再压一次，字节数必须完全不变。
+  # 这条专治"重编码器逐代膨胀"——产物自身也会被下一轮扫描看到，
+  # 若每压一次都变大一点，长期运行就会持续膨胀。
+  GEN1=$(wc -c <"$WORK/audio/probe-out.mp3" 2>/dev/null)
+  docker run --rm -v "$WORK/audio:/mnt" --entrypoint /bin/sh "$IMAGE" -c \
+    'ffmpeg -hide_banner -loglevel error -i /mnt/probe-out.mp3 -b:a 32k /mnt/probe-out2.mp3 -y' >/dev/null 2>&1
+  GEN2=$(wc -c <"$WORK/audio/probe-out2.mp3" 2>/dev/null)
+  if [ -n "$GEN1" ] && [ "$GEN1" = "$GEN2" ]; then
+    c_ok "重复转码字节数不变（$GEN1 字节，无逐代膨胀）"
+  else
+    c_bad "重复转码产物体积变化：$GEN1 → $GEN2"
+  fi
+
+  # 错误码必须可区分。服务靠退出码判断"格式不支持"还是"文件读不到"，
+  # 两者混在一起会导致日志给出错误的排查建议。
+  #   183 == AVERROR_INVALIDDATA & 0xFF（ffmpeg 返回负错误码，被 shell 截成低 8 位）
+  #   254 == 文件不存在/无法打开
+  head -c 3000 /dev/urandom > "$WORK/audio/probe-bad.mp3"
+  BAD_CODE=$(docker run --rm -v "$WORK/audio:/mnt" --entrypoint /bin/sh "$IMAGE" -c \
+    'ffmpeg -hide_banner -loglevel error -i /mnt/probe-bad.mp3 -b:a 32k /mnt/bad-out.mp3 -y >/dev/null 2>&1; echo $?' 2>/dev/null | tr -d '\r')
+  if [ "$BAD_CODE" = "183" ]; then
+    c_ok "非 MP3 输入返回 183（可区分于路径错误）"
+  else
+    c_bad "非 MP3 输入的退出码为 $BAD_CODE，期望 183"
+  fi
+
+  MISSING_CODE=$(docker run --rm --entrypoint /bin/sh "$IMAGE" -c \
+    'ffmpeg -hide_banner -loglevel error -i /mnt/does-not-exist.mp3 -b:a 32k /mnt/x.mp3 -y >/dev/null 2>&1; echo $?' 2>/dev/null | tr -d '\r')
+  if [ "$MISSING_CODE" = "254" ]; then
+    c_ok "文件不存在返回 254（与格式错误可区分）"
+  else
+    c_bad "文件不存在的退出码为 $MISSING_CODE，期望 254"
+  fi
+else
+  c_skip "宿主机无 ffmpeg（或 lavfi），跳过容器内直接转码验证"
+fi
+
+
 # 判定依据是"有没有对它发起转换"，而不是日志里出现过文件名——
 # 后者太宽，"发现待转换"和"开始转换"都可能出现在不相干的上下文里。
 if [ -f "$WORK/audio/low.mp3" ]; then

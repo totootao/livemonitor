@@ -1,46 +1,59 @@
-// Package media 的转码器：纯 Go 实现 MP3 解码 + 重采样 + 重编码。
+// Package media 的转码器：调用外部 ffmpeg 把 MP3 重新编码为更低码率。
 //
-// 为什么不用 ffmpeg：
-// 本项目的音频需求只有两条——把文件统一成 MP3、把 MP3 压到更低码率。
-// 为此在镜像里塞进整套 ffmpeg（约 130MB 共享库，绝大多数是视频编解码器
-// 与 GPU 后端）并不划算。这里改用两个纯 Go 库自己完成：
+// 为什么用 ffmpeg 而不是纯 Go：
+// 早期版本用 go-mp3 解码 + shine-mp3 编码自己实现，好处是零外部依赖，
+// 但实测下来有两个硬伤——
 //
-//	解码  github.com/hajimehoshi/go-mp3   —— MPEG-1/2 Layer III 解码为 PCM
-//	编码  github.com/braheezy/shine-mp3   —— Shine 编码器的 Go 移植（定点运算）
+//	速度  同一文件 0.38s vs 0.14s，LAME 的 C 实现快一倍多
+//	音质  原实现固定降采样到 22050Hz 单声道，而同为 32k 码率下，
+//	      44.1kHz 立体声的体积几乎相同（117.6 vs 117.4 KB），
+//	      也就是说那点"省下来"根本不存在，纯粹是白丢音质
 //
-// 代价是不支持除 MP3 以外的输入格式（TS/AAC/FLAC 等需要各自的解码器），
-// 音质也弱于 LAME。对"录完压低码率存档"这一用途可以接受。
+// 代价是镜像里要带一个可执行文件。这里用的是为 MP3 转码专门裁剪的
+// 1.4MB 静态二进制（见 docker/README-ffmpeg.md），而不是完整版 ffmpeg——
+// 后者在 Alpine 上要拖进约 130MB 的共享库，几乎全是本项目用不到的视频组件。
+//
+// 输出参数取 ffmpeg 默认的 44.1kHz 立体声，刻意不传 -ac/-ar：
+// 32k 码率下体积由时长决定而非采样率，降采样换不来空间，只会损失音质。
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
-
 	"strings"
+	"syscall"
 	"time"
-
-	"github.com/braheezy/shine-mp3/pkg/mp3"
-	gomp3 "github.com/hajimehoshi/go-mp3"
 
 	"github.com/totootao/livemonitor/internal/logging"
 )
 
-// 输出参数：与原脚本一致——单声道、22050Hz。
-// 这两个值是对"语音为主的直播录音"在体积与可懂度之间的折中。
-const (
-	outputSampleRate = 22050
-	outputChannels   = 1
-)
+// FFmpegBinary 是转码所依赖的可执行文件名。
+//
+// 通过 PATH 查找而非写死绝对路径：镜像里放在 /usr/local/bin，
+// 但开发机上通常用的是系统安装的 ffmpeg，靠 PATH 两边都能工作。
+const FFmpegBinary = "ffmpeg"
 
-// Transcoder 用纯 Go 把 MP3 重新编码为更低码率的 MP3。
+// ffmpegInvalidData 是 ffmpeg 在"输入无法识别"时使用的退出码。
+//
+// 这个码有实际意义：它把"用户丢进来一个 AAC/FLAC/损坏文件"与
+// "ffmpeg 自己出问题"区分开，前者只需提示用户转格式，
+// 后者才值得告警。这个值来自 ffmpeg 源码中的 AVERROR_INVALIDDATA
+// 取模 256 后的结果（-1094995529 & 0xFF）。
+const ffmpegInvalidData = 183
+
+// Transcoder 调用外部 ffmpeg 把 MP3 重新编码为更低码率。
 //
 // 零值不可用，需经 NewTranscoder 构造。
 type Transcoder struct {
+	// bin 是 ffmpeg 可执行文件的路径，由 Available 解析后缓存在此。
+	// 留空表示尚未解析，届时走 PATH 查找。
+	bin     string
 	bitrate string
 	log     *logging.Logger
 	timeout time.Duration
@@ -48,8 +61,8 @@ type Transcoder struct {
 
 // NewTranscoder 创建转码器。bitrate 形如 "32k"，为空时取 DefaultOutputBitrate。
 //
-// 参数名沿用历史上的 ffmpeg 路径参数以便平滑替换，现已忽略——保留是为了
-// 不破坏调用方签名（manager 与测试都在用）。
+// 第一个参数保留自更早的版本（那时用于指定 ffmpeg 路径），现已忽略——
+// 路径统一由 Available 从 PATH 解析。签名不改成 (string) 是为了不动调用方。
 func NewTranscoder(_ string, bitrate string, log *logging.Logger) *Transcoder {
 	if bitrate == "" {
 		bitrate = DefaultOutputBitrate
@@ -64,78 +77,24 @@ func NewTranscoder(_ string, bitrate string, log *logging.Logger) *Transcoder {
 
 // Available 检查转码所需的依赖是否就绪。
 //
-// 纯 Go 实现没有外部可执行文件依赖，因此只在编译期确定的问题（不支持的
-// 目标码率）才会失败。保留该方法是为了与原先的依赖自检流程对齐。
+// 与纯 Go 版本不同，这里是真的在做外部依赖自检：ffmpeg 不存在时必须
+// 在启动阶段就报出来，而不是等第一次转码才失败——后者会让用户先看到
+// 一堆"处理文件失败"，却不容易联想到是镜像/环境缺了可执行文件。
 func (t *Transcoder) Available() error {
-	if _, err := parseTarget(t.bitrate); err != nil {
-		return fmt.Errorf("MP3 输出码率 %q 不受支持: %w", t.bitrate, err)
+	path, err := exec.LookPath(FFmpegBinary)
+	if err != nil {
+		return fmt.Errorf("未找到可执行文件 %q，转码功能不可用: %w", FFmpegBinary, err)
 	}
+	t.bin = path
 	return nil
 }
 
 // Bitrate 返回输出码率字符串。
 func (t *Transcoder) Bitrate() string { return t.bitrate }
 
-// transcodeParams 是一次转码的全部输入参数。
-type transcodeParams struct {
-	bitrateKbps      int
-	bitrateIndex     int
-	sampleRate       int
-	channels         int
-	granulesPerFrame int
-}
-
-// parseTarget 把 "32k" 之类的码率字符串解析为编码参数。
-func parseTarget(bitrate string) (transcodeParams, error) {
-	kbps := BitrateToKbps(bitrate)
-	if kbps <= 0 {
-		return transcodeParams{}, fmt.Errorf("无法解析码率 %q", bitrate)
-	}
-	idx := bitrateIndex(kbps, outputSampleRate)
-	if idx < 0 {
-		return transcodeParams{}, fmt.Errorf("输出采样率 %d 下没有 %dk 这一档码率", outputSampleRate, kbps)
-	}
-	// 22050Hz 落在 MPEG-2，每帧 1 个 granule、576 个样本。
-	return transcodeParams{
-		bitrateKbps:      kbps,
-		bitrateIndex:     idx,
-		sampleRate:       outputSampleRate,
-		channels:         outputChannels,
-		granulesPerFrame: 1,
-	}, nil
-}
-
-// mpeg1Bitrates / mpeg2Bitrates 是 Layer III 的码率表（索引 0 与 15 为保留值）。
-// 与编码器内部使用的一致；帧头里写的是索引而非数值，所以必须自己反查。
-var (
-	mpeg1Bitrates = []int{-1, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, -1}
-	mpeg2Bitrates = []int{-1, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160, -1}
-)
-
-// bitrateIndex 按采样率推断 MPEG 版本，反查码率在表中的索引。
-func bitrateIndex(kbps, sampleRate int) int {
-	table := mpeg2Bitrates
-	if sampleRate >= 32000 {
-		table = mpeg1Bitrates
-	}
-	for i, v := range table {
-		if v == kbps {
-			return i
-		}
-	}
-	return -1
-}
-
-// transcodeResult 描述一次转码的产物。
-type transcodeResult struct {
-	Output string
-	Err    error
-}
-
 // TranscodeFile 把 src 转为低码率 MP3，成功后按原脚本语义删除源文件并重命名产物。
 //
-// 之所以叫"转码"而非"转换"：源与产物都是 MP3，这里做的是解码到 PCM、
-// 重采样到单声道 22050Hz、再以目标码率重新编码。
+// 之所以叫"转码"而非"转换"：源与产物都是 MP3，这里做的是解码再以目标码率重编码。
 func (t *Transcoder) TranscodeFile(ctx context.Context, src string) error {
 	base := strings.TrimSuffix(src, filepath.Ext(src))
 	outputTmp := base + "-i.mp3"
@@ -147,20 +106,19 @@ func (t *Transcoder) TranscodeFile(ctx context.Context, src string) error {
 		return t.finalize(src, outputTmp, outputFinal)
 	}
 
-	params, err := parseTarget(t.bitrate)
-	if err != nil {
-		return err
-	}
-
-	t.log.Info("开始转换: %s -> %s（目标 %dk / 单声道 / %dHz）",
-		filepath.Base(src), filepath.Base(outputTmp), params.bitrateKbps, params.sampleRate)
+	t.log.Info("开始转换: %s -> %s（目标 %s / 44100Hz / 立体声）",
+		filepath.Base(src), filepath.Base(outputTmp), t.bitrate)
 
 	runCtx, cancel := context.WithTimeout(ctx, t.timeout)
 	defer cancel()
 
-	size, err := t.encodeFile(runCtx, src, outputTmp, params)
+	size, err := t.encodeFile(runCtx, src, outputTmp)
 	if err != nil {
 		// 失败时清理可能产生的残缺文件，避免下次误判为已完成。
+		//
+		// 这一步不能省：ffmpeg 在部分错误下会留下一个已经建好、
+		// 但内容不完整的输出文件。若不删，下一轮扫描会因为它存在而走
+		// "中间产物已存在"分支，直接把它当成成功结果改名为最终文件。
 		if _, statErr := os.Stat(outputTmp); statErr == nil {
 			_ = os.Remove(outputTmp)
 		}
@@ -171,180 +129,116 @@ func (t *Transcoder) TranscodeFile(ctx context.Context, src string) error {
 	return t.finalize(src, outputTmp, outputFinal)
 }
 
-// encodeFile 解码 src 并编码到 dst，返回产物字节数。
-func (t *Transcoder) encodeFile(ctx context.Context, src, dst string, p transcodeParams) (int64, error) {
-	in, err := os.Open(src)
-	if err != nil {
-		return 0, err
-	}
-	defer in.Close()
-
-	dec, err := gomp3.NewDecoder(in)
-	if err != nil {
-		// 走到这里基本可以确定不是 MP3（或已损坏）。给出可操作的提示：
-		// 纯 Go 方案不支持非 MP3 输入，用户需要先自行转成 MP3。
-		return 0, fmt.Errorf("无法解码 %s（纯 Go 方案仅支持 MP3 输入）: %w", filepath.Base(src), err)
-	}
-
-	mono, srcRate, err := t.decodeToMono(ctx, dec)
-	if err != nil {
-		return 0, err
-	}
-	if len(mono) == 0 {
-		return 0, errors.New("源文件没有可用的音频采样")
-	}
-
-	pcm := resampleLinear(mono, srcRate, p.sampleRate)
-	if len(pcm) == 0 {
-		return 0, errors.New("重采样后没有采样数据")
-	}
-
-	return t.writeEncoded(dst, pcm, p)
-}
-
-// decodeToMono 把解码器输出读成单声道 int16 采样序列，同时返回源采样率。
-//
-// 注意：go-mp3 的 Decoder 输出**恒为 16 位小端双声道**（即使源是单声道 MP3
-// 也会复制成两份），因此这里固定按 LRLR 处理，无需判断声道数。
-func (t *Transcoder) decodeToMono(ctx context.Context, dec *gomp3.Decoder) ([]int16, int, error) {
-	srcRate := dec.SampleRate()
-
-	// 先按最大可能长度预留，直播录音动辄数小时，逐次 append 触发的大量
-	// 扩容拷贝会明显拖慢速度。
-	est := int(srcRate) * 60
-	if est < 1<<16 {
-		est = 1 << 16
-	}
-	out := make([]int16, 0, est)
-
-	buf := make([]byte, 64*1024)
-	// 跨 Read 调用保留半个立体声帧（2 字节），否则缓冲区边界处会丢样本。
-	var carry [2]byte
-	hasCarry := false
-
-	for {
-		if err := ctx.Err(); err != nil {
-			return nil, 0, err
+// encodeFile 调用 ffmpeg 把 src 重新编码到 dst，返回产物字节数。
+func (t *Transcoder) encodeFile(ctx context.Context, src, dst string) (int64, error) {
+	bin := t.bin
+	if bin == "" {
+		// 调用方可能没先调 Available；这里补一次，避免直接 exec 空路径。
+		resolved, err := exec.LookPath(FFmpegBinary)
+		if err != nil {
+			return 0, fmt.Errorf("未找到可执行文件 %q: %w", FFmpegBinary, err)
 		}
-		n, readErr := dec.Read(buf)
-		if n > 0 {
-			var chunk []byte
-			if hasCarry {
-				chunk = make([]byte, 0, n+2)
-				chunk = append(chunk, carry[:]...)
-				chunk = append(chunk, buf[:n]...)
-			} else {
-				chunk = buf[:n]
-			}
-			out = append(out, pcmToMono(chunk)...)
+		bin = resolved
+		t.bin = resolved
+	}
 
-			// 记录落单的字节，留给下一轮拼接。
-			if rem := len(chunk) % 4; rem != 0 {
-				copy(carry[:], chunk[len(chunk)-rem:])
-				hasCarry = true
-			} else {
-				hasCarry = false
-			}
+	// -y 覆盖输出；-loglevel error 只保留错误，正常转码不产生噪声。
+	// 不传 -ac/-ar：保持 ffmpeg 默认的 44.1kHz 立体声，理由见包注释。
+	args := []string{
+		"-hide_banner",
+		"-loglevel", "error",
+		"-i", src,
+		"-b:a", t.bitrate,
+		dst,
+		"-y",
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
+
+	// 用独立的进程组并在超时时杀掉整组。
+	//
+	// CommandContext 默认只对直接子进程发 SIGKILL；若 ffmpeg 再派生
+	// 子进程，那些孙子进程会变成孤儿继续占用 CPU 与文件句柄。
+	// 本项目用的这个裁剪版 ffmpeg 不 fork，但设一下成本极低，
+	// 属于"出问题时能兜住"的防御。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
 		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return nil, 0, fmt.Errorf("解码失败: %w", readErr)
-		}
-	}
-	return out, srcRate, nil
-}
-
-// pcmToMono 把 16 位小端立体声交错 PCM（LRLR）混为单声道。
-// 尾部不足 4 字节的部分会被忽略，调用方负责拼接残字节。
-func pcmToMono(b []byte) []int16 {
-	out := make([]int16, 0, len(b)/4)
-	for i := 0; i+3 < len(b); i += 4 {
-		l := int32(int16(uint16(b[i]) | uint16(b[i+1])<<8))
-		r := int32(int16(uint16(b[i+2]) | uint16(b[i+3])<<8))
-		out = append(out, int16((l+r)/2))
-	}
-	return out
-}
-
-// resampleLinear 用线性插值做重采样。
-//
-// 直播录音以人声为主，且输出只有 22050Hz，线性插值的混叠在听感上
-// 可忽略；换成窗函数 sinc 插值会显著增加实现复杂度与运行时间。
-func resampleLinear(in []int16, from, to int) []int16 {
-	if from == to || len(in) == 0 {
-		return in
-	}
-	n := int(int64(len(in)) * int64(to) / int64(from))
-	if n <= 0 {
-		return nil
-	}
-	out := make([]int16, n)
-	ratio := float64(from) / float64(to)
-	for i := range out {
-		pos := float64(i) * ratio
-		i0 := int(pos)
-		if i0 >= len(in)-1 {
-			out[i] = in[len(in)-1]
-			continue
-		}
-		frac := pos - float64(i0)
-		out[i] = int16(float64(in[i0])*(1-frac) + float64(in[i0+1])*frac)
-	}
-	return out
-}
-
-// writeEncoded 用 Shine 编码器把 PCM 写入 dst，返回字节数。
-func (t *Transcoder) writeEncoded(dst string, pcm []int16, p transcodeParams) (int64, error) {
-	samplesPerFrame := 576 * p.granulesPerFrame
-	if r := len(pcm) % samplesPerFrame; r != 0 {
-		// 补齐到整帧，避免尾帧样本不足导致编码器读到越界。
-		pcm = append(pcm, make([]int16, samplesPerFrame-r)...)
+		// 负号表示整个进程组。
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 
-	out, err := os.Create(dst)
-	if err != nil {
-		return 0, err
-	}
-	defer out.Close()
+	// stderr 必须单独收：ffmpeg 的错误信息只走 stderr，
+	// 不捕获的话失败时只剩一句 "exit status 1"，无从定位。
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 
-	enc := mp3.NewEncoder(p.sampleRate, p.channels)
-	// NewEncoder 内部是按默认 128k 算好帧参数的，换码率必须自己重算，
-	// 否则写出的帧头与帧长不匹配，解码器会算错帧边界、时长严重偏短。
-	enc.Mpeg.Bitrate = int64(p.bitrateKbps)
-	enc.Mpeg.BitrateIndex = int64(p.bitrateIndex)
-	enc.Mpeg.GranulesPerFrame = int64(p.granulesPerFrame)
-	bitsPerFrame := float64(samplesPerFrame) / float64(p.sampleRate) * float64(p.bitrateKbps) * 1000
-	enc.Mpeg.WholeSlotsPerFrame = int64(bitsPerFrame / 8)
-	enc.Mpeg.FracSlotsPerFrame = bitsPerFrame/8 - float64(enc.Mpeg.WholeSlotsPerFrame)
-	enc.Mpeg.SlotLag = -enc.Mpeg.FracSlotsPerFrame
-
-	// 编码器维护跨调用的输入游标，因此每次必须传入连续的整数帧切片。
-	for i := 0; i < len(pcm); i += samplesPerFrame {
-		end := i + samplesPerFrame
-		if end > len(pcm) {
-			end = len(pcm)
-		}
-		data, written := enc.EncodeBufferInterleaved(pcm[i:end])
-		if written > 0 {
-			if _, err := out.Write(data[:written]); err != nil {
-				return 0, err
-			}
-		}
+	if err := cmd.Run(); err != nil {
+		return 0, t.describeFailure(src, err, stderr.String())
 	}
 
-	if err := out.Close(); err != nil {
-		return 0, err
-	}
 	info, err := os.Stat(dst)
 	if err != nil {
-		return 0, err
+		return 0, fmt.Errorf("转码后无法读取产物 %s: %w", filepath.Base(dst), err)
 	}
 	if info.Size() == 0 {
-		return 0, errors.New("编码后输出为空")
+		return 0, errors.New("转码产物为空")
 	}
 	return info.Size(), nil
+}
+
+// describeFailure 把 ffmpeg 的退出状态与 stderr 整理成可操作的错误。
+func (t *Transcoder) describeFailure(src string, runErr error, stderr string) error {
+	detail := strings.TrimSpace(stderr)
+	// stderr 可能多行；只取前几行，避免把整个错误塞进日志。
+	if lines := strings.Split(detail, "\n"); len(lines) > 3 {
+		detail = strings.Join(lines[:3], "; ")
+	}
+
+	base := filepath.Base(src)
+
+	// 上下文超时/取消要与 ffmpeg 自身的失败区分开：
+	// 前者说明文件过大或卡住，后者说明文件本身有问题。
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		switch exitErr.ExitCode() {
+		case ffmpegInvalidData:
+			return fmt.Errorf(
+				"无法解码 %s：不是 MP3，或文件已损坏（ffmpeg 仅支持 MP3 输入）%s",
+				base, suffixDetail(detail))
+		case -1:
+			// 被信号杀死（多半是超时后我们发的 SIGKILL）。
+			return fmt.Errorf("转码 %s 被中断（可能是耗时超过 %s）%s",
+				base, formatDuration(int(t.timeout.Seconds())), suffixDetail(detail))
+		default:
+			return fmt.Errorf("转码 %s 失败（ffmpeg 退出码 %d）%s",
+				base, exitErr.ExitCode(), suffixDetail(detail))
+		}
+	}
+	return fmt.Errorf("执行 ffmpeg 失败: %w%s", runErr, suffixDetail(detail))
+}
+
+// formatDuration 把秒数格式化为人类可读的时长（如 "1小时"、"30秒"）。
+func formatDuration(secs int) string {
+	switch {
+	case secs <= 0:
+		return "0秒"
+	case secs%3600 == 0:
+		return fmt.Sprintf("%d小时", secs/3600)
+	case secs%60 == 0:
+		return fmt.Sprintf("%d分钟", secs/60)
+	default:
+		return fmt.Sprintf("%d秒", secs)
+	}
+}
+
+// suffixDetail 把 stderr 摘要拼成错误后缀；无内容时返回空串。
+func suffixDetail(detail string) string {
+	if detail == "" {
+		return ""
+	}
+	return ": " + detail
 }
 
 // finalize 删除源文件并把 -i.mp3 中间产物改名为最终 .mp3。

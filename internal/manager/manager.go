@@ -206,6 +206,13 @@ func (m *Manager) Run(ctx context.Context, webAddr string) int {
 		m.log.Warn("Docker Engine 不可达: %v，容器控制将不可用", err)
 	}
 
+	// 探测转码依赖（ffmpeg）。缺了它 MP3 压缩这一步会全盘失败，
+	// 但容器定时启停、日志监控、归档都还能正常工作，
+	// 所以同样只告警——比直接拒绝启动更符合"部分功能降级"的实际需要。
+	if err := m.video.TranscoderAvailable(); err != nil {
+		m.log.Warn("转码器不可用: %v，MP3 压缩将不可用（容器控制与归档不受影响）", err)
+	}
+
 	// 启动 Web 管理界面。
 	// 注意：Web 地址是用户在命令行/环境变量里显式给出的，说明管理界面是预期功能。
 	// 此时监听失败（例如端口被占用）不能只记一条日志就继续跑——进程看起来"正常运行"，

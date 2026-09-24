@@ -30,8 +30,8 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
     && /out/livemonitor version
 
 # ---------- 运行阶段 ----------
-# 音频转码已改为纯 Go 实现（go-mp3 解码 + shine-mp3 编码），
-# 不再需要 ffmpeg，因此运行阶段可以是极简的 alpine。
+# 音频转码由 docker/ffmpeg 提供——一个为 MP3 转码专门裁剪的 1.4MB 静态二进制，
+# 而不是完整版 ffmpeg。详见 docker/README-ffmpeg.md。
 FROM alpine:3.22
 
 ARG VERSION=dev
@@ -40,7 +40,9 @@ ARG VERSION=dev
 #   tzdata           定时任务依赖正确的时区数据
 #   ca-certificates  HTTPS 证书（Docker Engine API 走 unix socket，但用户可能配置 TLS）
 #   su-exec          以指定 UID/GID 运行，处理挂载目录属主
-# 不装 ffmpeg：转码由纯 Go 代码完成，整套 ffmpeg 的共享库约 130MB。
+# 不装发行版的 ffmpeg：完整版在 Alpine 上要拖进约 130MB 共享库，
+# 其中几乎全是本项目用不到的视频编解码器与 GPU 后端。
+# 转码只需要 MP3 那一条路径，用裁剪版即可，见下面的 COPY。
 RUN apk add --no-cache \
         tzdata \
         ca-certificates \
@@ -56,7 +58,12 @@ COPY --from=builder /out/livemonitor /usr/local/bin/livemonitor
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY config.example.json /app/config.example.json
 
-RUN chmod +x /usr/local/bin/entrypoint.sh
+# 裁剪版 ffmpeg（静态链接，无动态库依赖）与它的 LGPL 许可文本。
+# 放 /usr/local/bin 下，转码器通过 PATH 查找。
+COPY docker/ffmpeg /usr/local/bin/ffmpeg
+COPY docker/COPYING.LGPLv2.1 /usr/local/share/doc/ffmpeg/COPYING.LGPLv2.1
+
+RUN chmod +x /usr/local/bin/entrypoint.sh /usr/local/bin/ffmpeg
 
 # 媒体目录与归档目录，建议通过卷挂载宿主机路径。
 VOLUME ["/audio"]

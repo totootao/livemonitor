@@ -64,22 +64,45 @@ Web 界面的**立即执行**不受此记录限制，是人的显式意图。
 
 ## 设计取舍
 
-### 为什么不依赖外部程序
+### 关于外部程序
 
 | 原先依赖 | 现在的做法 | 收益 |
 | --- | --- | --- |
 | `docker` CLI（约 31MB 静态二进制） | 标准库经 unix socket 直接调 Docker Engine API | 镜像不再需要 CLI |
-| `ffmpeg`（约 130MB 共享库） | 纯 Go：`go-mp3` 解码 + `shine-mp3` 编码 | 镜像不再需要 ffmpeg |
+| `ffmpeg`（官方静态构建约 130MB） | 自编译裁剪版：只保留 mp3 解封装 + LAME 编码 | 二进制 **1.4MB**，镜像 18MB |
 | `mutagen`（Python 库） | `internal/media/mp3.go` 自行解析 MPEG 帧头 | 无第三方运行时依赖 |
+
+### 为什么最终还是用了 ffmpeg
+
+早期版本试过"纯 Go 转码"（`go-mp3` 解码 + `shine-mp3` 编码）。能跑通，
+但代价太大：
+
+- **慢**：同一份 30 秒素材，纯 Go 约 0.38s，ffmpeg 约 0.14s（快 2.7 倍）。
+  批量处理几十个文件时差距会放大到分钟级。
+- **音质弱**：`shine-mp3` 官方定位就是"能听、文件更大、质量不如 LAME"。
+- **参数被绑死**：为了绕开 resample 的实现成本，输出被迫固定在
+  22050Hz / 单声道，等于在用户不知情的情况下丢了一半声道和高频。
+
+改用 ffmpeg 后这三点同时解决，而且通过**裁剪构建**把体积代价压到可忽略：
+`--disable-everything` 只开 `mp3` 解封装、`mp3` 编码（libmp3lame）、`file` 协议，
+静态链接 musl，**1.4MB**。相对完整版省下约 128MB，相对纯 Go 方案只多 2.9MB
+（镜像 15.6MB → 18.5MB）。
+
+换来的是：44100Hz 立体声输出（保持输入规格）、真正的 LAME 编码质量、
+全项目零第三方 Go 依赖（`go.mod` 无任何 `require`）。
+
+> 二进制与许可证原文随仓库提供：`docker/ffmpeg`、`docker/COPYING.LGPLv2.1`，
+> 来源与校验值见 `docker/README-ffmpeg.md`。
+> ffmpeg 以 LGPLv2.1 授权，静态链接的分发需要随附许可证原文——已包含在镜像内
+> `/usr/local/share/doc/ffmpeg/COPYING.LGPLv2.1`。
 
 ### 代价
 
-- **只支持 MP3 作为输入**。TS/AAC/FLAC 等格式没有可用的纯 Go 解码器，
+- **只支持 MP3 作为输入**。裁剪版只编译了 mp3 解封装，TS/AAC/FLAC 等格式
   扫描到时会给出一条告警日志，提示先转成 MP3。需要直接从 TS 转码的场景
   不适合本程序。
-- **音质弱于 LAME**。`shine-mp3` 是 Shine 编码器的移植版，官方定位就是
-  "能听、文件更大、质量不如 LAME"。对"录制后压低码率存档"这一用途足够。
-- 由此换来的是：镜像体积从 144MB 降到 **15.6MB**，且没有外部进程调用。
+- 镜像需随附 LGPL 许可证文本（已处理，见上）。
+
 
 ## 与原脚本的对应关系
 
@@ -89,13 +112,16 @@ Web 界面的**立即执行**不受此记录限制，是人的显式意图。
 | `mutagen.mp3.MP3().info.bitrate` | `internal/media/mp3.go` | 自行解析 MPEG 帧头，跳过 ID3v2 标签，含二次帧校验防误判 |
 | `subprocess.run/Popen` | `internal/dockerctl`、`internal/media` | 全部改为 `context` 驱动，支持超时与优雅取消 |
 | `subprocess.run(["docker", ...])` | `internal/dockerctl` + Docker Engine API | 直接用标准库经 unix socket 调 Engine API，镜像内不再需要 docker CLI |
-| `subprocess.run(["ffmpeg", ...])` | `internal/media/transcoder.go` | 纯 Go 解码 + 重采样 + 重编码，镜像内不再需要 ffmpeg |
+| `subprocess.run(["ffmpeg", ...])` | `internal/media/transcoder.go` | 调用镜像内自带的裁剪版 ffmpeg（1.4MB），通过退出码区分"格式不支持"与"文件读不到" |
 | `threading.Thread` + `Event` | goroutine + `context.Context` | 用 context 取消替代 Event 信号，避免竞态 |
 | `re.compile(r'[\x00-\x1F\x7F]')` | `monitor.CleanLogLine` | 逐 rune 扫描，保留制表符 |
 | `shutil.move` | `media.moveFile` | 先 `rename`，跨分区时回退为复制 + 删除 |
 | 硬编码 `CONTAINERS_CONFIG` | `config.json` + Web 界面 | 配置外置，支持校验、容器级关键词覆盖、运行时热更新 |
 
-> 这是项目里仅有的两个第三方依赖（都用于 MP3 编解码），其余全部为标准库。
+> 除下面两处外，其余全部为标准库：
+> - MP3 帧头解析（`internal/media/mp3.go`）为自研，无第三方依赖；
+> - 音频转码通过子进程调用镜像内自带的裁剪版 ffmpeg（非 Go 依赖，故 `go.mod` 为空）。
+
 
 ## 快速开始
 
@@ -256,17 +282,18 @@ make e2e               # 构建镜像后跑全流程（需要本机 docker）
 IMAGE=tototao/livemonitor:latest bash scripts/e2e.sh   # 直接测已有镜像
 ```
 
-49 项断言，覆盖 8 个方面：
+约 80 项断言，覆盖 9 个方面：
 
 | 分组 | 验证内容 |
 | --- | --- |
-| 镜像内容 | 确认 `ffmpeg` / `docker` CLI **确实不存在**，时区数据可用，entrypoint 可执行 |
-| 素材准备 | 用 ffmpeg 造多种码率、带/不带 Xing 头的测试文件 |
+| 镜像内容 | 确认 `ffmpeg` **存在且为裁剪版**（无 lavfi，防止被换成 130MB 完整版）、随附 LGPL 许可证、`docker`/`dockerd`/`ffprobe` 不存在、时区数据可用 |
+| 素材准备 | 用宿主机的 ffmpeg 造多种码率、立体声、带/不带 Xing 头的测试文件 |
 | CLI 子命令 | `init` / `check` 的行为与错误提示（含重复 init 拒绝覆盖） |
 | 压缩主流程 | 日志关键节点、不支持格式告警**且去重**（周期性扫描不应刷屏） |
-| 产物校验 | 码率/采样率/声道/时长/压缩比，并验证低码率文件**被跳过** |
+| 产物校验 | 采样率/声道/码率/时长/压缩比，并验证低码率文件**被跳过** |
+| 容器内直连转码 | 绕过服务直接调镜像内的 ffmpeg：验证静态链接可用、重复转码不膨胀、退出码可区分错误类型 |
 | Web 界面 | 首页、`/api/state`、改设置写回磁盘、非法输入返回 400 |
-| 容器控制 | 真实 Engine API 启停容器 |
+| 容器控制 | 真实 Engine API 启停容器、接管已运行容器、外部停止后状态以 Docker 为准 |
 | 优雅退出 | SIGTERM 后正常退出并打印停止流程 |
 
 想单独对真实 Docker 测 Engine API 客户端：
@@ -292,10 +319,13 @@ internal/logging/         带作用域前缀的并发安全日志
 internal/dockerctl/       Docker Engine API 客户端（unix socket + HTTP，无 CLI 依赖）
 internal/scheduler/       每日定点调度（支持按 ID 精确增删）
 internal/monitor/         容器生命周期监控
-internal/media/           MP3 帧头解析（跳过 Xing/Info 信息帧）、纯 Go 重编码、目录扫描与归档
+internal/media/           MP3 帧头解析（跳过 Xing/Info 信息帧）、调 ffmpeg 重编码、目录扫描与归档
 internal/runtime/         可热更新的并发安全配置存储（原子落盘）
 internal/web/             Web 管理界面与 JSON API（go:embed 内嵌页面）
 internal/manager/         编排各组件、Web 服务与信号处理
 scripts/verify-embed.sh   校验二进制内嵌了 Web 页面（CI 用）
-scripts/e2e.sh            容器级端到端测试（49 项断言）
+scripts/e2e.sh            容器级端到端测试（约 80 项断言）
+docker/ffmpeg             自编译的裁剪版 ffmpeg（1.4MB，MP3→MP3 专用）
+docker/COPYING.LGPLv2.1   ffmpeg 的 LGPL 许可证原文（合规随附）
+docker/README-ffmpeg.md   二进制来源、构建参数、校验值与升级步骤
 ```

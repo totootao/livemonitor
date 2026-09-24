@@ -1,109 +1,93 @@
 package media
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
-
-	"github.com/braheezy/shine-mp3/pkg/mp3"
-	gomp3 "github.com/hajimehoshi/go-mp3"
 
 	"github.com/totootao/livemonitor/internal/logging"
 )
 
-// ---- 测试素材生成（纯 Go，不再依赖 ffmpeg） ----
+// ---- 测试素材生成 ----
 
-// genMP3 用纯 Go 编码器合成一段指定码率、指定采样率的 MP3。
+// requireFFmpeg 在环境缺 ffmpeg（或 ffmpeg 不带所需输入格式）时跳过测试。
 //
-// 历史上这里调用 ffmpeg 造素材，去掉 ffmpeg 依赖后改为直接使用
-// Shine 编码器，测试因此完全自持、可在任何环境跑。
+// 转码相关用例真的会去调 ffmpeg，缺了它只能跳过而不是失败——
+// 否则在没有 ffmpeg 的开发机（如只跑码率解析的单测）上会得到假阳性。
+// 用 t.Skip 而非 t.Fatal，并在提示里说明原因，便于区分"环境不全"与"真的挂了"。
+//
+// 这里额外探测 lavfi 是否可用。原因：本项目镜像里带的是**为 MP3 转码裁剪过**的
+// ffmpeg（docker/ffmpeg），它只有 mp3 demuxer，既没有 lavfi 也没有 s16le，
+// 因而无法凭空"造"出音频，只能 MP3→MP3 重编码。若有人在容器里跑这些测试，
+// 用 lavfi 造素材的那几条会以一个看不懂的 "Unknown input format: 'lavfi'"
+// 失败。提前探测并给出明确提示，比让人对着那句报错猜要好。
+func requireFFmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath(FFmpegBinary); err != nil {
+		t.Skipf("跳过：环境没有 %s，无法验证转码（%v）", FFmpegBinary, err)
+	}
+	if !supportsLavfi() {
+		t.Skipf("跳过：当前 %s 不带 lavfi（多半是镜像里那个裁剪版），"+
+			"无法合成测试素材；请用带 lavfi 的完整版 ffmpeg 跑测试", FFmpegBinary)
+	}
+}
+
+// requireAnyFFmpeg 只要求环境里有 ffmpeg，不要求它带 lavfi。
+//
+// 适用于不需要合成素材的用例——它们只调 ffmpeg 做 MP3→MP3 重编码，
+// 镜像里那个裁剪版也满足。与 requireFFmpeg 区分开，
+// 是为了让这类用例在裁剪版上也能真跑，而不是被一并跳过。
+func requireAnyFFmpeg(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath(FFmpegBinary); err != nil {
+		t.Skipf("跳过：环境没有 %s（%v）", FFmpegBinary, err)
+	}
+}
+
+// supportsLavfi 探测 ffmpeg 是否支持 lavfi 虚拟输入设备。
+func supportsLavfi() bool {
+	out, err := exec.Command(FFmpegBinary, "-hide_banner", "-demuxers").Output()
+	if err != nil {
+		// 拿不到列表就假定支持——这条探测只是为了让跳过信息更友好，
+		// 不该因为它自己失败而误跳过真正该跑的测试。
+		return true
+	}
+	return strings.Contains(string(out), "lavfi")
+}
+
+// genMP3 合成一段指定码率、指定采样率的 MP3，用作测试素材。
+//
+// 用 ffmpeg 自身来造素材（而非另找一个编码器）：这样测试素材与生产转码
+// 走同一条编码路径，产物的 Xing 头、帧长等特征与实际情形一致，
+// 不会出现"测试素材太规整、掩盖了真实文件才会触发的解析问题"。
 func genMP3(t *testing.T, path string, bitrateKbps, sampleRate, seconds int, toneHz float64) {
 	t.Helper()
-	pcm := sinePCM(sampleRate, seconds, toneHz)
-	if err := writeMP3File(path, pcm, bitrateKbps, sampleRate); err != nil {
-		t.Fatalf("生成测试 MP3 失败: %v", err)
-	}
-}
+	requireFFmpeg(t)
 
-// sinePCM 生成一段正弦波 PCM（单声道 int16）。
-func sinePCM(sampleRate, seconds int, freq float64) []int16 {
-	n := sampleRate * seconds
-	out := make([]int16, n)
-	// 幅度取满量程的一半，避免定点编码器在大信号上出现削波混叠。
-	const amp = 12000
-	for i := range out {
-		phase := 2 * 3.14159265358979 * freq * float64(i) / float64(sampleRate)
-		out[i] = int16(amp * sinApprox(phase))
+	// 用 lavfi 的正弦波发生器直接产出目标码率的 MP3。
+	// 声道数固定 2，与生产输出一致（本项目的转码产物是立体声）。
+	cmd := exec.Command(FFmpegBinary,
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi",
+		"-i", fmt.Sprintf("sine=frequency=%g:duration=%d:sample_rate=%d", toneHz, seconds, sampleRate),
+		"-b:a", fmt.Sprintf("%dk", bitrateKbps),
+		"-ac", "2",
+		path, "-y",
+	)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("生成测试 MP3 失败: %v: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return out
-}
-
-// sinApprox 是 sin 的简易实现，精度对测试足够（<1e-3）。
-func sinApprox(x float64) float64 {
-	const twoPi = 6.283185307179586
-	const pi = 3.141592653589793
-	for x > pi {
-		x -= twoPi
-	}
-	for x < -pi {
-		x += twoPi
-	}
-	x2 := x * x
-	return x * (1 - x2/6*(1-x2/20*(1-x2/42)))
-}
-
-// writeMP3File 用 Shine 把单声道 PCM 写成指定码率的 MP3 文件。
-//
-// 编码器内部按默认 128k 算好帧参数，换码率必须自己重算——与
-// transcoder.go 的 writeEncoded 保持同一套逻辑，否则帧头与帧长不匹配。
-func writeMP3File(path string, pcm []int16, bitrateKbps, sampleRate int) error {
-	out, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
-	const channels = 1
-	enc := mp3.NewEncoder(sampleRate, channels)
-	idx := bitrateIndex(bitrateKbps, sampleRate)
-	if idx < 0 {
-		return fmt.Errorf("采样率 %d 下不支持 %dk 码率", sampleRate, bitrateKbps)
-	}
-	granules := 1
-	samplesPerFrame := 576
-	if sampleRate >= 32000 {
-		granules = 2
-		samplesPerFrame = 1152
-	}
-
-	enc.Mpeg.Bitrate = int64(bitrateKbps)
-	enc.Mpeg.BitrateIndex = int64(idx)
-	enc.Mpeg.GranulesPerFrame = int64(granules)
-	bitsPerFrame := float64(samplesPerFrame) / float64(sampleRate) * float64(bitrateKbps) * 1000
-	enc.Mpeg.WholeSlotsPerFrame = int64(bitsPerFrame / 8)
-	enc.Mpeg.FracSlotsPerFrame = bitsPerFrame/8 - float64(enc.Mpeg.WholeSlotsPerFrame)
-	enc.Mpeg.SlotLag = -enc.Mpeg.FracSlotsPerFrame
-
-	if rem := len(pcm) % samplesPerFrame; rem != 0 {
-		pcm = append(pcm, make([]int16, samplesPerFrame-rem)...)
-	}
-	for i := 0; i < len(pcm); i += samplesPerFrame {
-		end := i + samplesPerFrame
-		if end > len(pcm) {
-			end = len(pcm)
-		}
-		data, written := enc.EncodeBufferInterleaved(pcm[i:end])
-		if written > 0 {
-			if _, err := out.Write(data[:written]); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
 }
 
 // ---- 原有测试：码率解析 ----
@@ -206,6 +190,7 @@ func TestProbeMP3Empty(t *testing.T) {
 
 // TestTranscodeAndCleanup 验证转码产物参数正确、源文件被清理、中间产物被改名。
 func TestTranscodeAndCleanup(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "live.mp3")
 	genMP3(t, src, 128, 44100, 2, 440)
@@ -231,20 +216,24 @@ func TestTranscodeAndCleanup(t *testing.T) {
 	if info.BitrateKbps != 32 {
 		t.Errorf("码率 = %d, 期望 32", info.BitrateKbps)
 	}
-	if info.SampleRate != 22050 {
-		t.Errorf("采样率 = %d, 期望 22050", info.SampleRate)
+	// 44.1kHz / 立体声：与实际转码路径保持一致的期望值。
+	// 参数选择的理由见 TestTranscodeOutputFormat 的注释。
+	if info.SampleRate != 44100 {
+		t.Errorf("采样率 = %d, 期望 44100", info.SampleRate)
 	}
-	if info.Channels != 1 {
-		t.Errorf("声道数 = %d, 期望 1（应混为单声道）", info.Channels)
+	if info.Channels != 2 {
+		t.Errorf("声道数 = %d, 期望 2（立体声）", info.Channels)
 	}
 }
 
-// TestTranscodePreservesDuration 验证重采样后时长基本不变。
+// TestTranscodePreservesDuration 验证转码后时长基本不变。
 //
-// 这是对"编码器帧参数未随码率重算导致时长严重偏短"这一坑的回归防护：
-// Shine 的 NewEncoder 内部按默认 128k 算好帧参数，换码率必须自己重算，
-// 否则写出的帧头与帧长不匹配。
+// 这是对"编码器帧参数未随码率重算导致时长严重偏短"这一坑的回归防护。
+// 早期纯 Go 实现需要自己重算 Shine 的帧参数，否则写出的帧头与帧长不匹配；
+// 现在交给 ffmpeg 了，但这条断言依然有价值——它守的是最终行为，
+// 而不关心底层是哪个编码器。
 func TestTranscodePreservesDuration(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	const seconds = 3
 	src := filepath.Join(dir, "live.mp3")
@@ -264,6 +253,7 @@ func TestTranscodePreservesDuration(t *testing.T) {
 
 // TestTranscodeInvalidInput 验证非 MP3 输入给出可操作的错误信息。
 func TestTranscodeInvalidInput(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "bogus.mp3")
 	if err := os.WriteFile(src, []byte("不是音频数据"), 0o644); err != nil {
@@ -287,6 +277,7 @@ func TestTranscodeInvalidInput(t *testing.T) {
 
 // TestTranscodeExistingIntermediate 验证中间产物已存在时直接改名，不重复编码。
 func TestTranscodeExistingIntermediate(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "live.mp3")
 	genMP3(t, src, 128, 44100, 1, 440)
@@ -310,63 +301,69 @@ func TestTranscodeExistingIntermediate(t *testing.T) {
 	}
 }
 
-// TestAvailableRejectsBadBitrate 验证不可用的码率会在自检阶段被发现。
-func TestAvailableRejectsBadBitrate(t *testing.T) {
+// TestAvailableDetectsFFmpeg 验证自检会真的去找 ffmpeg 可执行文件。
+//
+// 这是新旧实现最本质的区别：纯 Go 版没有外部依赖，Available() 只能查码率；
+// 现在真的依赖一个外部二进制，缺失时必须在启动阶段就报错，
+// 而不是等第一次转码才失败（那时用户看到的是一堆"处理文件失败"，很难联想到根因）。
+func TestAvailableDetectsFFmpeg(t *testing.T) {
 	log := logging.New("test")
-	for _, bad := range []string{"999k", "abc", ""} {
-		tc := &Transcoder{bitrate: bad, log: log}
-		if bad == "" {
-			// 空串在 NewTranscoder 里会被填默认值，这里直接构造才可能为空。
-			if err := tc.Available(); err == nil {
-				t.Errorf("空码率应被拒绝")
-			}
-			continue
-		}
-		if err := tc.Available(); err == nil {
-			t.Errorf("码率 %q 应被拒绝", bad)
-		}
+
+	// 1) 正常环境：PATH 里有 ffmpeg 时应当通过。
+	//
+	// 这里刻意只用"存在性"守卫（requireAnyFFmpeg），不用 requireFFmpeg：
+	// 本用例不合成素材，裁剪版的 ffmpeg 也完全能跑。
+	// 而且它正是最该在裁剪版上验证的一条——镜像里放的就是那个二进制。
+	requireAnyFFmpeg(t)
+	tc := NewTranscoder("", "32k", log)
+	if err := tc.Available(); err != nil {
+		t.Fatalf("环境有 ffmpeg 但自检失败: %v", err)
+	}
+	if tc.bin == "" {
+		t.Error("Available 成功后应缓存解析到的路径")
+	}
+
+	// 2) 把 PATH 清空，模拟镜像里漏掉了可执行文件。
+	//    这是回归测试：确保缺依赖时真的会失败，而不是悄悄放过去。
+	t.Setenv("PATH", t.TempDir())
+	if err := NewTranscoder("", "32k", log).Available(); err == nil {
+		t.Error("PATH 中没有 ffmpeg 时自检应当失败")
+	} else if !contains(err.Error(), FFmpegBinary) {
+		t.Errorf("错误信息应点名缺失的可执行文件，实际: %v", err)
 	}
 }
 
-// TestResampleLinear 验证重采样长度与端点行为。
-func TestResampleLinear(t *testing.T) {
-	in := []int16{0, 10, 20, 30, 40, 50, 60, 70}
-	out := resampleLinear(in, 44100, 22050)
-	if len(out) != len(in)/2 {
-		t.Errorf("降采样后长度 = %d, 期望 %d", len(out), len(in)/2)
+// TestTranscodeOutputFormat 验证转码产物的关键参数。
+//
+// 钉住两件事：
+//  1. 输出是 44.1kHz —— 旧实现固定降采样到 22050Hz。实测同码率下体积几乎相同
+//     （117.6 vs 117.4 KB），降采样换不来空间，只损失音质，因此改为保持 44.1kHz。
+//  2. 输出是立体声 —— 同理。
+//
+// 这两项是刻意选的默认值，改动会直接影响所有既有用户的听感，值得用测试锁住。
+func TestTranscodeOutputFormat(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.mp3")
+	// 源用 44.1kHz 立体声，确保"保持原样"与"降采样"能被区分开。
+	genMP3(t, src, 128, 44100, 2, 440)
+
+	log := logging.New("test")
+	if err := NewTranscoder("", "32k", log).TranscodeFile(context.Background(), src); err != nil {
+		t.Fatalf("转码失败: %v", err)
 	}
 
-	same := resampleLinear(in, 44100, 44100)
-	if len(same) != len(in) {
-		t.Errorf("同采样率应原样返回，长度 = %d", len(same))
+	probe, err := ProbeMP3(src)
+	if err != nil {
+		t.Fatalf("解析产物失败: %v", err)
 	}
-
-	if got := resampleLinear(nil, 44100, 22050); got != nil {
-		t.Error("空输入应返回 nil")
+	if probe.SampleRate != 44100 {
+		t.Errorf("输出采样率 = %d, 期望 44100（不应降采样）", probe.SampleRate)
 	}
-}
-
-// TestPCMToMono 验证立体声交错的混音与残字节处理。
-func TestPCMToMono(t *testing.T) {
-	// 两组立体声帧：L=100,R=200 → 150；L=-100,R=-200 → -150
-	b := []byte{
-		100, 0, 200, 0,
-		0x9C, 0xFF, 0x38, 0xFF, // -100, -200
+	if probe.Channels != 2 {
+		t.Errorf("输出声道数 = %d, 期望 2（立体声）", probe.Channels)
 	}
-	out := pcmToMono(b)
-	if len(out) != 2 {
-		t.Fatalf("应产出 2 个样本，实际 %d", len(out))
-	}
-	if out[0] != 150 {
-		t.Errorf("第 1 个样本 = %d, 期望 150", out[0])
-	}
-	if out[1] != -150 {
-		t.Errorf("第 2 个样本 = %d, 期望 -150", out[1])
-	}
-
-	// 尾部不足 4 字节应被忽略，且不 panic。
-	if got := pcmToMono([]byte{1, 0, 2, 0, 3}); len(got) != 1 {
-		t.Errorf("残字节应被忽略，实际产出 %d 个样本", len(got))
+	if probe.BitrateKbps != 32 {
+		t.Errorf("输出码率 = %d, 期望 32", probe.BitrateKbps)
 	}
 }
 
@@ -374,6 +371,7 @@ func TestPCMToMono(t *testing.T) {
 
 // TestProcessorScanFilters 验证扫描过滤规则：静置时间、低码率 MP3、-i.mp3、归档目录。
 func TestProcessorScanFilters(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	histDir := filepath.Join(dir, "历史")
 	if err := os.MkdirAll(histDir, 0o755); err != nil {
@@ -455,6 +453,7 @@ func TestProcessorScanFilters(t *testing.T) {
 // TestProcessedMP3NotRequeued 验证转码产物（32k）不会被反复重新入队。
 // 这是对"输出码率低于跳过阈值导致无限重编码"这一回归的防护。
 func TestProcessedMP3NotRequeued(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 
 	src := filepath.Join(dir, "live.mp3")
@@ -501,6 +500,7 @@ func TestProcessedMP3NotRequeued(t *testing.T) {
 // 查不到文件导致防重判据失效，于是同一文件被无限次重新编码。
 // 修复方式是在开始转码前先认领文件；本测试通过在同一路径反复扫描来锁定该行为。
 func TestNoRepeatTranscodeDuringProcessing(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	src := filepath.Join(dir, "live.mp3")
 	genMP3(t, src, 128, 44100, 1, 440)
@@ -551,6 +551,7 @@ func TestNoRepeatTranscodeDuringProcessing(t *testing.T) {
 
 // TestArchiveOldMP3 验证过期 MP3 会被移入归档目录，且文件名冲突时自动加时间戳。
 func TestArchiveOldMP3(t *testing.T) {
+	requireFFmpeg(t)
 	dir := t.TempDir()
 	sub := filepath.Join(dir, "子目录")
 	histDir := filepath.Join(dir, "历史")
@@ -614,32 +615,31 @@ func TestArchiveOldMP3(t *testing.T) {
 
 // ---- 辅助 ----
 
-// decodedSeconds 用 go-mp3 解码并计算时长。
+// decodedSeconds 计算 MP3 的时长（秒）。
+//
+// 原先用 go-mp3 解码数采样数来算。删除纯 Go 转码器后没有解码器了，
+// 改用 ffmpeg 读取容器时长——比逐帧解码更直接，且与生产转码走同一个工具。
 func decodedSeconds(t *testing.T, path string) float64 {
 	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
+	requireFFmpeg(t)
 
-	dec, err := gomp3.NewDecoder(f)
-	if err != nil {
-		t.Fatalf("解码 %s 失败: %v", path, err)
-	}
-	rate := dec.SampleRate()
+	// 只打印容器信息时 ffmpeg 会把数据输出到 stderr 并以非 0 退出，
+	// 所以这里不能按"失败"处理，得解析 stderr 拿 Duration。
+	cmd := exec.Command(FFmpegBinary, "-hide_banner", "-i", path)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	_ = cmd.Run()
 
-	buf := make([]byte, 32*1024)
-	total := 0
-	for {
-		n, rerr := dec.Read(buf)
-		total += n
-		if rerr != nil {
-			break
-		}
+	// 形如 "  Duration: 00:00:02.00, start: ..."
+	re := regexp.MustCompile(`Duration:\s*(\d+):(\d+):(\d+\.?\d*)`)
+	m := re.FindStringSubmatch(stderr.String())
+	if m == nil {
+		t.Fatalf("无法从 ffmpeg 输出中解析时长:\n%s", stderr.String())
 	}
-	// go-mp3 恒输出双声道 16 位，即每帧 4 字节。
-	return float64(total/4) / float64(rate)
+	h, _ := strconv.Atoi(m[1])
+	min, _ := strconv.Atoi(m[2])
+	sec, _ := strconv.ParseFloat(m[3], 64)
+	return float64(h)*3600 + float64(min)*60 + sec
 }
 
 func contains(s, sub string) bool {
